@@ -2,15 +2,16 @@ name: Build Transcoder and Push to Harbor
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "transcoder/**"
+  #push:
+  #  branches:
+  #    - main
+  #  paths:
+#      - "transcoder/**"
 
 env:
   REGISTRY: harbor.bnov.net
   FULL_IMAGE: harbor.bnov.net/plex-video-ready/transcoder
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:

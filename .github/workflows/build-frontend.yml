@@ -2,15 +2,16 @@ name: Build UI and Push to Harbor
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "ui/**"
+  #push:
+  #  branches:
+  #    - main
+  #  paths:
+ #     - "ui/**"
 
 env:
   REGISTRY: harbor.bnov.net
   FULL_IMAGE: harbor.bnov.net/plex-video-ready/ui
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:

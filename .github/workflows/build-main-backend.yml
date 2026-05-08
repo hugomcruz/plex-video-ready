@@ -2,15 +2,16 @@ name: Build Main Backend and Push to Harbor
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "main-backend/**"
+  #push:
+  #  branches:
+  #    - main
+  #  paths:
+#      - "main-backend/**"
 
 env:
   REGISTRY: harbor.bnov.net
   FULL_IMAGE: harbor.bnov.net/plex-video-ready/main-backend
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
