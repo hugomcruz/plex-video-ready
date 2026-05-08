@@ -1,0 +1,103 @@
+version: "3.9"
+
+services:
+  main-backend:
+    build: ./main-backend
+    container_name: main-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY
+      - UPLOAD_DIR=/uploads
+      - TRANSCODED_DIR=/transcoded
+      #- DIST_SERVER_URL=http://dist-server:8001
+      - DIST_SERVER_URL=https://your-dist-server.example.com
+      - DIST_SERVICE_PASSWORD=change_me
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/plex
+    volumes:
+      - /path/to/uploads:/uploads
+      - /path/to/transcoded:/transcoded
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+#      - dist-server
+
+  transcoder:
+    build: ./transcoder
+    container_name: transcoder
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/uploads
+      - TRANSCODED_DIR=/transcoded
+      #- DIST_SERVER_URL=http://dist-server:8001
+      - DIST_SERVER_URL=https://your-dist-server.example.com
+      - DIST_SERVICE_PASSWORD=change_me
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/plex
+    volumes:
+      - /path/to/uploads:/uploads
+      - /path/to/transcoded:/transcoded
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  dist-server:
+    build: ./dist-server
+    container_name: dist-server
+    ports:
+      - "8001:8001"
+    environment:
+      - BASE_PATH=/media
+      - DIST_SECRET_KEY
+      - DIST_SERVICE_PASSWORD
+    volumes:
+      - /path/to/media:/media
+
+  ui:
+    build: ./ui
+    container_name: ui
+    # Port not exposed to host — nginx-local proxies to it
+    expose:
+      - "80"
+
+  nginx-local:
+    image: nginx:alpine
+    container_name: nginx-local
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - ui
+      - main-backend
+  #  profiles:
+  #    - local
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=plex
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d plex"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  redis_data:
+  postgres_data:

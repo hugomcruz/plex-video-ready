@@ -1,0 +1,46 @@
+name: Build Transcoder and Push to Harbor
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "transcoder/**"
+
+env:
+  REGISTRY: harbor.bnov.net
+  FULL_IMAGE: harbor.bnov.net/plex-video-ready/transcoder
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./transcoder
+          file: ./transcoder/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.FULL_IMAGE }}:build-${{ github.run_number }}
+            ${{ env.FULL_IMAGE }}:latest

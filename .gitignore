@@ -1,0 +1,46 @@
+# Environment / secrets
+.env
+*.env.local
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+.mypy_cache/
+.ruff_cache/
+
+# Node / React
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/coverage/
+
+# Docker volumes / local media (bind-mount paths)
+/uploads/
+/transcoded/
+/media/
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+docker-compose.yml
