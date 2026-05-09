@@ -315,9 +315,48 @@ def retry_job(
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in ("failed", "completed"):
         raise HTTPException(status_code=400, detail="Only failed or completed jobs can be retried")
-    job.status = "pending"
+    job.status = "queued"
     job.error = None
     db.commit()
+    rdb.rpush(TRANSCODE_QUEUE, job_id)
+    return job_to_dict(job)
+
+
+@app.post("/jobs/{job_id}/stop")
+def stop_job(
+    job_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in ("queued", "transcoding", "uploading"):
+        raise HTTPException(status_code=400, detail="Job is not active")
+    job.status = "cancelled"
+    db.commit()
+    # Signal the worker to abort the running ffmpeg process
+    rdb.setex(f"cancel:{job_id}", 3600, "1")
+    return job_to_dict(job)
+
+
+@app.post("/jobs/{job_id}/restart")
+def restart_job(
+    job_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in ("failed", "cancelled", "completed"):
+        raise HTTPException(status_code=400, detail="Only failed, cancelled, or completed jobs can be restarted")
+    job.status = "queued"
+    job.error = None
+    job.transcode_progress = {}
+    db.commit()
+    # Clear any lingering cancel flag
+    rdb.delete(f"cancel:{job_id}")
     rdb.rpush(TRANSCODE_QUEUE, job_id)
     return job_to_dict(job)
 

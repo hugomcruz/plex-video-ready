@@ -34,6 +34,12 @@ DIST_SERVER_URL = os.environ.get("DIST_SERVER_URL", "http://dist-server:8001")
 DIST_SERVICE_PASSWORD = os.environ.get("DIST_SERVICE_PASSWORD", "dist_service_password")
 
 TRANSCODE_QUEUE = "transcode_queue"
+CANCEL_KEY_PREFIX = "cancel:"
+
+
+class JobCancelledError(Exception):
+    """Raised when a job is cancelled by the user."""
+
 
 # Profile definitions: (label, width, height)
 PROFILES = [
@@ -291,17 +297,30 @@ def get_output_file_info(path: Path) -> dict:
         return {}
 
 
-def transcode(src: Path, dst: Path, target_width: int, target_height: int, target_codec: str = "hevc", use_copy: bool = False):
+def transcode(
+    src: Path,
+    dst: Path,
+    target_width: int,
+    target_height: int,
+    target_codec: str = "hevc",
+    use_copy: bool = False,
+    bitrate_lo: int = 0,
+    bitrate_hi: int = 0,
+    cancel_flag=None,
+):
     """Run ffmpeg to transcode src → dst at the given resolution.
 
     When use_copy=True the video stream is copied as-is (codec/bitrate already
     acceptable) and only the audio is normalised to AAC 128k.
     target_codec is "h264" or "hevc".
+    bitrate_lo/bitrate_hi are the target range in bits/sec; when provided the
+    encoder targets the midpoint and is capped at the maximum.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     if use_copy:
         cmd = [
             "ffmpeg", "-y",
+            "-threads", "0",
             "-i", str(src),
             "-c:v", "copy",
             "-c:a", "aac",
@@ -318,20 +337,51 @@ def transcode(src: Path, dst: Path, target_width: int, target_height: int, targe
             f"force_original_aspect_ratio=decrease,"
             f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
         )
+        if bitrate_hi:
+            target_bps = (bitrate_lo + bitrate_hi) // 2
+            bitrate_args = [
+                "-b:v", str(target_bps),
+                "-maxrate", str(bitrate_hi),
+                "-bufsize", str(bitrate_hi * 2),
+            ]
+            log.info(
+                "Encoding %s with target %d kbps, maxrate %d kbps",
+                dst.name, target_bps // 1000, bitrate_hi // 1000,
+            )
+        else:
+            bitrate_args = ["-crf", "23"]
         cmd = [
             "ffmpeg", "-y",
+            "-threads", "0",
             "-i", str(src),
             "-vf", scale_filter,
             "-c:v", video_encoder,
-            "-crf", "23",
-            "-preset", "fast",
+            "-preset", "slow",
+            *bitrate_args,
+            *(
+                ["-x265-params", "pools=none:wpp=1:pmode=1:pme=1"]
+                if target_codec == "hevc"
+                else []
+            ),
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
             str(dst),
         ]
     log.info("Running: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    while True:
+        ret = proc.poll()
+        if ret is not None:
+            break
+        if cancel_flag and cancel_flag():
+            proc.kill()
+            proc.wait()
+            raise JobCancelledError("Job cancelled by user")
+        time.sleep(1)
+    if proc.returncode != 0:
+        stderr_out = proc.stderr.read().decode(errors="replace")
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr_out.encode())
 
 
 def upload_to_dist(local_path: Path, dest_path: str):
@@ -368,7 +418,13 @@ def process_job(job_id: str, db: Session):
     job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not job:
         raise ValueError(f"Job {job_id} not found in database")
+    if job.status == "cancelled":
+        log.info("Job %s already cancelled, skipping", job_id)
+        return
     log.info("Processing job %s (%s)", job_id, job.original_filename)
+
+    def is_cancelled() -> bool:
+        return bool(rdb.exists(f"{CANCEL_KEY_PREFIX}{job_id}"))
 
     src_path = Path(job.upload_path)
     if not src_path.exists():
@@ -401,6 +457,13 @@ def process_job(job_id: str, db: Session):
     profile_bitrates = dict(job.profile_bitrates or {})
 
     for label, prof_width, prof_height in PROFILES:
+        # Check for cancellation before starting each profile
+        if is_cancelled():
+            log.info("Job %s cancelled before profile %s", job_id, label)
+            job.status = "cancelled"
+            db.commit()
+            raise JobCancelledError("Job cancelled by user")
+
         # Never upscale
         if prof_height > src_height:
             log.info("Skipping %s (source %dp < target %dp)", label, src_height, prof_height)
@@ -426,7 +489,13 @@ def process_job(job_id: str, db: Session):
             flag_modified(job, "transcode_progress")
             db.commit()
             try:
-                transcode(src_path, out_path, prof_width, prof_height, target_codec=target_codec, use_copy=use_copy)
+                bitrate_range = BITRATE_RANGES.get(target_codec, {}).get(label, (0, 0))
+                transcode(
+                    src_path, out_path, prof_width, prof_height,
+                    target_codec=target_codec, use_copy=use_copy,
+                    bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
+                    cancel_flag=is_cancelled,
+                )
 
                 # Probe and log output file info (codec, bitrate, fps)
                 out_info = get_output_file_info(out_path)
@@ -457,6 +526,13 @@ def process_job(job_id: str, db: Session):
                 flag_modified(job, "transcode_progress")
                 db.commit()
                 log.info("Transcoded %s → %s", label, out_path)
+            except JobCancelledError:
+                progress[label] = "cancelled"
+                job.transcode_progress = progress
+                flag_modified(job, "transcode_progress")
+                job.status = "cancelled"
+                db.commit()
+                raise
             except subprocess.CalledProcessError as e:
                 progress[label] = "failed"
                 job.transcode_progress = progress
@@ -566,11 +642,13 @@ def main():
             db = SessionLocal()
             try:
                 process_job(job_id, db)
+            except JobCancelledError:
+                log.info("Job %s was cancelled", job_id)
             except Exception as exc:
                 log.error("Job %s failed: %s", job_id, exc, exc_info=True)
                 try:
                     job = db.query(JobModel).filter(JobModel.id == job_id).first()
-                    if job and job.status != "failed":
+                    if job and job.status not in ("failed", "cancelled"):
                         job.status = "failed"
                         job.error = str(exc)
                         db.commit()

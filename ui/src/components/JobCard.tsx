@@ -1,7 +1,7 @@
 import { Job } from "../pages/DashboardPage";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
-import { CheckCircle, Clock, AlertCircle, Loader2, RotateCcw, ChevronRight } from "lucide-react";
+import { CheckCircle, Clock, AlertCircle, Loader2, RotateCcw, ChevronRight, Square, XCircle } from "lucide-react";
 
 const STATUS_STYLES: Record<string, { color: string; icon: React.ReactNode }> = {
   queued: { color: "text-yellow-400", icon: <Clock size={16} /> },
@@ -10,6 +10,7 @@ const STATUS_STYLES: Record<string, { color: string; icon: React.ReactNode }> = 
   uploading: { color: "text-cyan-400", icon: <Loader2 size={16} className="animate-spin" /> },
   completed: { color: "text-green-400", icon: <CheckCircle size={16} /> },
   failed: { color: "text-red-400", icon: <AlertCircle size={16} /> },
+  cancelled: { color: "text-orange-400", icon: <XCircle size={16} /> },
 };
 
 export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () => void }) {
@@ -19,6 +20,18 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
   async function retry(e: React.MouseEvent) {
     e.stopPropagation();
     await api.post(`/jobs/${job.id}/retry`);
+    onRefresh();
+  }
+
+  async function stop(e: React.MouseEvent) {
+    e.stopPropagation();
+    await api.post(`/jobs/${job.id}/stop`);
+    onRefresh();
+  }
+
+  async function restart(e: React.MouseEvent) {
+    e.stopPropagation();
+    await api.post(`/jobs/${job.id}/restart`);
     onRefresh();
   }
 
@@ -69,12 +82,28 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
       )}
 
       <div className="flex justify-end mt-3 gap-2">
+        {["queued", "transcoding", "uploading"].includes(job.status) && (
+          <button
+            onClick={stop}
+            className="flex items-center gap-1 text-xs bg-red-900/40 hover:bg-red-900/70 text-red-300 px-3 py-1.5 rounded-lg transition"
+          >
+            <Square size={12} /> Stop
+          </button>
+        )}
         {job.status === "failed" && (
           <button
             onClick={retry}
             className="flex items-center gap-1 text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition"
           >
             <RotateCcw size={12} /> Retry
+          </button>
+        )}
+        {["cancelled", "failed", "completed"].includes(job.status) && (
+          <button
+            onClick={restart}
+            className="flex items-center gap-1 text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition"
+          >
+            <RotateCcw size={12} /> Restart
           </button>
         )}
         <span className="flex items-center gap-1 text-xs text-gray-600">
