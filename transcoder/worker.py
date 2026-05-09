@@ -356,10 +356,10 @@ def transcode(
             "-i", str(src),
             #"-vf", scale_filter,
             "-c:v", video_encoder,
-            "-preset", "slow",
+            "-preset", "medium",
             *bitrate_args,
             *(
-                ["-x265-params", "pools=none:wpp=1:pmode=1:pme=1"]
+                ["-x265-params", "pools=+:wpp=1:pmode=1:pme=1"]
                 if target_codec == "hevc"
                 else []
             ),
