@@ -354,7 +354,7 @@ def transcode(
             "ffmpeg", "-y",
             "-threads", "0",
             "-i", str(src),
-            "-vf", scale_filter,
+            #"-vf", scale_filter,
             "-c:v", video_encoder,
             "-preset", "slow",
             *bitrate_args,
