@@ -1,6 +1,7 @@
 """
 Transcoder Worker
 - Polls Redis queue for job IDs
+- Downloads source file from S3
 - Uses ffprobe to detect source resolution, codec, and bitrate
 - Transcodes to required profiles (only downscaling)
 - Stream-copies when source already meets target codec + bitrate range
@@ -16,25 +17,118 @@ import subprocess
 import logging
 from pathlib import Path
 
-import redis
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 import httpx
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, Float, text
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
-from sqlalchemy.orm.attributes import flag_modified
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [transcoder] %(message)s")
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [transcoder] %(levelname)s %(message)s",
+)
 log = logging.getLogger(__name__)
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/plex")
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/uploads"))
+BACKEND_URL   = os.environ.get("BACKEND_URL", "http://main-backend:8000")
+WORKER_TOKEN  = os.environ.get("WORKER_TOKEN", "")
 TRANSCODED_DIR = Path(os.environ.get("TRANSCODED_DIR", "/transcoded"))
 DIST_SERVER_URL = os.environ.get("DIST_SERVER_URL", "http://dist-server:8001")
 DIST_SERVICE_PASSWORD = os.environ.get("DIST_SERVICE_PASSWORD", "dist_service_password")
 
+# S3 config
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
+S3_ACCESS_KEY   = os.environ.get("S3_ACCESS_KEY", "")
+S3_SECRET_KEY   = os.environ.get("S3_SECRET_KEY", "")
+S3_BUCKET       = os.environ.get("S3_BUCKET", "")
+S3_REGION       = os.environ.get("S3_REGION", "us-east-1")
+
+
+# ---------------------------------------------------------------------------
+# Backend REST client
+# ---------------------------------------------------------------------------
+
+def _worker_headers() -> dict:
+    return {"Authorization": f"Bearer {WORKER_TOKEN}"}
+
+
+def api_dequeue() -> str | None:
+    """Pop the next job_id from the backend queue. Returns None if empty."""
+    resp = httpx.post(f"{BACKEND_URL}/worker/dequeue", headers=_worker_headers(), timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("job_id")
+
+
+def api_get_job(job_id: str) -> dict:
+    resp = httpx.get(f"{BACKEND_URL}/worker/jobs/{job_id}", headers=_worker_headers(), timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_patch_job(job_id: str, **fields) -> None:
+    """Send a partial update for a job. Only the supplied fields are updated."""
+    resp = httpx.patch(
+        f"{BACKEND_URL}/worker/jobs/{job_id}",
+        json=fields,
+        headers=_worker_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def api_is_cancelled(job_id: str) -> bool:
+    try:
+        resp = httpx.get(
+            f"{BACKEND_URL}/worker/jobs/{job_id}/cancelled",
+            headers=_worker_headers(),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return resp.json().get("cancelled", False)
+    except Exception:
+        return False  # treat transient errors as not-cancelled
+
+
+def wait_for_backend(max_wait: int = 120) -> None:
+    """Block until the main-backend /health endpoint responds."""
+    delay = 2
+    elapsed = 0
+    while elapsed < max_wait:
+        try:
+            resp = httpx.get(f"{BACKEND_URL}/health", timeout=5)
+            if resp.status_code == 200:
+                log.info("Backend ready at %s", BACKEND_URL)
+                return
+        except Exception as exc:
+            log.warning("Backend not ready (%s), retrying in %ds…", exc, delay)
+        time.sleep(delay)
+        elapsed += delay
+        delay = min(delay * 2, 15)
+    raise RuntimeError(f"Could not reach backend at {BACKEND_URL} after {max_wait}s")
+
+
+def get_s3_client():
+    kwargs = dict(
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY or None,
+        aws_secret_access_key=S3_SECRET_KEY or None,
+    )
+    if S3_ENDPOINT_URL:
+        kwargs["endpoint_url"] = S3_ENDPOINT_URL
+    return boto3.client("s3", **kwargs)
+
+
+def download_from_s3(s3_key: str, dest_path: Path) -> None:
+    """Download an S3 object to a local path."""
+    if not S3_BUCKET:
+        raise RuntimeError("S3_BUCKET is not configured")
+    log.info("Downloading s3://%s/%s → %s", S3_BUCKET, s3_key, dest_path)
+    s3 = get_s3_client()
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        s3.download_file(S3_BUCKET, s3_key, str(dest_path))
+    except (ClientError, NoCredentialsError) as e:
+        raise RuntimeError(f"S3 download failed: {e}") from e
+    log.info("Downloaded %s (%d bytes)", s3_key, dest_path.stat().st_size)
+
 TRANSCODE_QUEUE = "transcode_queue"
-CANCEL_KEY_PREFIX = "cancel:"
 
 
 class JobCancelledError(Exception):
@@ -77,68 +171,7 @@ CODEC_MAP: dict[str, str] = {
 # The codec we transcode TO (must be a key in BITRATE_RANGES)
 TARGET_CODEC = "h264"
 
-# ---------------------------------------------------------------------------
-# Database (same schema as main-backend)
-# ---------------------------------------------------------------------------
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-class JobModel(Base):
-    __tablename__ = "jobs"
-
-    id = Column(String, primary_key=True)
-    original_filename = Column(String, nullable=False)
-    upload_path = Column(Text)
-    dest_path = Column(Text)
-    season = Column(Integer)
-    episode = Column(Integer)
-    status = Column(String, nullable=False, default="uploaded")
-    created_at = Column(String)
-    created_by = Column(String)
-    transcode_progress = Column(JSONB, default=dict)
-    source_resolution = Column(JSONB)
-    source_codec = Column(String)
-    source_bitrate = Column(BigInteger)
-    source_fps = Column(Float)
-    source_file_size = Column(BigInteger)
-    target_codec = Column(String, default="hevc")
-    profile_bitrates = Column(JSONB, default=dict)
-    error = Column(Text)
-
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine)
-
-
-def wait_for_db(max_wait: int = 60) -> None:
-    """Wait until PostgreSQL is reachable and ensure the jobs table exists."""
-    delay = 2
-    elapsed = 0
-    while elapsed < max_wait:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            Base.metadata.create_all(bind=engine)
-            log.info("Database ready")
-            return
-        except Exception as exc:
-            log.warning("Database not ready (%s), retrying in %ds…", exc, delay)
-            time.sleep(delay)
-            elapsed += delay
-            delay = min(delay * 2, 10)
-    raise RuntimeError(f"Could not connect to database after {max_wait}s")
-
-
-# ---------------------------------------------------------------------------
-# Redis (queue only)
-# ---------------------------------------------------------------------------
-
-rdb = redis.from_url(REDIS_URL, decode_responses=True)
-
-_dist_token: str = ""
 
 
 def get_dist_token() -> str:
@@ -317,10 +350,13 @@ def transcode(
     encoder targets the midpoint and is capped at the maximum.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_loglevel = os.environ.get("FFMPEG_LOG_LEVEL", "verbose")
+    ffmpeg_threads = os.environ.get("FFMPEG_THREADS", "0")
     if use_copy:
         cmd = [
             "ffmpeg", "-y",
-            "-threads", "0",
+            "-loglevel", ffmpeg_loglevel,
+            "-threads", ffmpeg_threads,
             "-i", str(src),
             "-c:v", "copy",
             "-c:a", "aac",
@@ -352,15 +388,22 @@ def transcode(
             bitrate_args = ["-crf", "23"]
         cmd = [
             "ffmpeg", "-y",
-            "-threads", "0",
+            "-loglevel", ffmpeg_loglevel,
+            "-threads", ffmpeg_threads,
             "-i", str(src),
-            #"-vf", scale_filter,
+            "-vf", scale_filter,
             "-c:v", video_encoder,
+            "-pix_fmt", "yuv420p",
             "-preset", "medium",
             *bitrate_args,
             *(
                 ["-x265-params", "pools=+:wpp=1:pmode=1:pme=1"]
                 if target_codec == "hevc"
+                else []
+            ),
+            *(
+                ["-tag:v", "hvc1"]
+                if target_codec == "hevc" and dst.suffix.lower() == ".mp4"
                 else []
             ),
             "-c:a", "aac",
@@ -370,6 +413,18 @@ def transcode(
         ]
     log.info("Running: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stderr_lines: list[str] = []
+
+    def _drain_stderr():
+        for raw in proc.stderr:
+            line = raw.decode(errors="replace").rstrip()
+            stderr_lines.append(line)
+            log.info("[ffmpeg] %s", line)
+
+    import threading
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
     while True:
         ret = proc.poll()
         if ret is not None:
@@ -379,9 +434,12 @@ def transcode(
             proc.wait()
             raise JobCancelledError("Job cancelled by user")
         time.sleep(1)
+
+    stderr_thread.join()
     if proc.returncode != 0:
-        stderr_out = proc.stderr.read().decode(errors="replace")
-        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr_out.encode())
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, stderr="\n".join(stderr_lines).encode()
+        )
 
 
 def upload_to_dist(local_path: Path, dest_path: str):
@@ -414,21 +472,30 @@ def upload_to_dist(local_path: Path, dest_path: str):
 # ---------------------------------------------------------------------------
 
 
-def process_job(job_id: str, db: Session):
-    job = db.query(JobModel).filter(JobModel.id == job_id).first()
-    if not job:
-        raise ValueError(f"Job {job_id} not found in database")
-    if job.status == "cancelled":
+def process_job(job_id: str) -> None:
+    job = api_get_job(job_id)
+    if job["status"] == "cancelled":
         log.info("Job %s already cancelled, skipping", job_id)
         return
-    log.info("Processing job %s (%s)", job_id, job.original_filename)
+    log.info("Processing job %s (%s)", job_id, job["original_filename"])
 
     def is_cancelled() -> bool:
-        return bool(rdb.exists(f"{CANCEL_KEY_PREFIX}{job_id}"))
+        return api_is_cancelled(job_id)
 
-    src_path = Path(job.upload_path)
-    if not src_path.exists():
-        raise FileNotFoundError(f"Source file not found: {src_path}")
+    # Resolve the source file: download from S3 if s3_key is set, else fall
+    # back to the legacy local upload_path for backward compatibility.
+    downloaded_path: Path | None = None
+    if job.get("s3_key"):
+        local_download = TRANSCODED_DIR / job_id / Path(job["original_filename"]).name
+        download_from_s3(job["s3_key"], local_download)
+        src_path = local_download
+        downloaded_path = local_download
+    elif job.get("upload_path"):
+        src_path = Path(job["upload_path"])
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source file not found: {src_path}")
+    else:
+        raise ValueError(f"Job {job_id} has neither s3_key nor upload_path")
 
     src_info = get_video_info(src_path)
     src_width, src_height = src_info["width"], src_info["height"]
@@ -440,37 +507,36 @@ def process_job(job_id: str, db: Session):
         f"{src_info['bitrate'] // 1000} kbps" if src_info["bitrate"] else "unknown",
     )
 
-    stem = Path(job.original_filename).stem
-    suffix = Path(job.original_filename).suffix
-    dest_folder = job.dest_path.rstrip("/")
+    stem = Path(job["original_filename"]).stem
+    suffix = Path(job["original_filename"]).suffix
+    dest_folder = job["dest_path"].rstrip("/")
 
-    job.status = "transcoding"
-    job.source_resolution = {"width": src_width, "height": src_height}
-    job.source_codec = src_info["codec"]
-    job.source_bitrate = src_info["bitrate"]
-    job.source_fps = src_info["fps"]
-    job.source_file_size = src_path.stat().st_size
-    db.commit()
+    api_patch_job(
+        job_id,
+        status="transcoding",
+        source_resolution={"width": src_width, "height": src_height},
+        source_codec=src_info["codec"],
+        source_bitrate=src_info["bitrate"],
+        source_fps=src_info["fps"],
+        source_file_size=src_path.stat().st_size,
+    )
 
-    target_codec = job.target_codec or TARGET_CODEC
-    progress = dict(job.transcode_progress or {})
-    profile_bitrates = dict(job.profile_bitrates or {})
+    target_codec = job.get("target_codec") or TARGET_CODEC
+    progress: dict = dict(job.get("transcode_progress") or {})
+    profile_bitrates: dict = dict(job.get("profile_bitrates") or {})
 
     for label, prof_width, prof_height in PROFILES:
         # Check for cancellation before starting each profile
         if is_cancelled():
             log.info("Job %s cancelled before profile %s", job_id, label)
-            job.status = "cancelled"
-            db.commit()
+            api_patch_job(job_id, status="cancelled")
             raise JobCancelledError("Job cancelled by user")
 
         # Never upscale
         if prof_height > src_height:
             log.info("Skipping %s (source %dp < target %dp)", label, src_height, prof_height)
             progress[label] = "skipped"
-            job.transcode_progress = progress
-            flag_modified(job, "transcode_progress")
-            db.commit()
+            api_patch_job(job_id, transcode_progress=progress)
             continue
 
         # Skip already completed profiles (resume support)
@@ -485,9 +551,7 @@ def process_job(job_id: str, db: Session):
         use_copy = should_copy(src_info, label, prof_height, target_codec)
         if progress.get(label) != "transcoded" or not out_path.exists():
             progress[label] = "transcoding"
-            job.transcode_progress = progress
-            flag_modified(job, "transcode_progress")
-            db.commit()
+            api_patch_job(job_id, transcode_progress=progress)
             try:
                 bitrate_range = BITRATE_RANGES.get(target_codec, {}).get(label, (0, 0))
                 transcode(
@@ -516,44 +580,35 @@ def process_job(job_id: str, db: Session):
                         out_info.get("total_bitrate_kbps", "?"),
                     )
                     profile_bitrates[label] = out_info
-                    job.profile_bitrates = profile_bitrates
-                    flag_modified(job, "profile_bitrates")
+                    api_patch_job(job_id, profile_bitrates=profile_bitrates)
                 else:
                     log.warning("Profile %s output info: unknown", label)
 
                 progress[label] = "transcoded"
-                job.transcode_progress = progress
-                flag_modified(job, "transcode_progress")
-                db.commit()
+                api_patch_job(job_id, transcode_progress=progress)
                 log.info("Transcoded %s → %s", label, out_path)
             except JobCancelledError:
                 progress[label] = "cancelled"
-                job.transcode_progress = progress
-                flag_modified(job, "transcode_progress")
-                job.status = "cancelled"
-                db.commit()
+                api_patch_job(job_id, transcode_progress=progress, status="cancelled")
                 raise
             except subprocess.CalledProcessError as e:
                 progress[label] = "failed"
-                job.transcode_progress = progress
-                flag_modified(job, "transcode_progress")
-                job.error = f"FFmpeg failed on profile {label}: {e}"
-                job.status = "failed"
-                db.commit()
+                api_patch_job(
+                    job_id,
+                    transcode_progress=progress,
+                    error=f"FFmpeg failed on profile {label}: {e}",
+                    status="failed",
+                )
                 raise
 
         # Upload to dist-server
         progress[label] = "uploading"
-        job.transcode_progress = progress
-        flag_modified(job, "transcode_progress")
-        db.commit()
+        api_patch_job(job_id, transcode_progress=progress)
         try:
             remote_dest = f"{dest_folder}/{out_filename}"
             upload_to_dist(out_path, remote_dest)
             progress[label] = "uploaded"
-            job.transcode_progress = progress
-            flag_modified(job, "transcode_progress")
-            db.commit()
+            api_patch_job(job_id, transcode_progress=progress)
             log.info("Uploaded %s to dist-server at %s", out_filename, remote_dest)
             # Remove the transcoded file now that it's safely on the dist-server
             try:
@@ -563,16 +618,17 @@ def process_job(job_id: str, db: Session):
                 log.warning("Could not remove transcoded file %s: %s", out_path, cleanup_err)
         except Exception as e:
             progress[label] = "upload_failed"
-            job.transcode_progress = progress
-            flag_modified(job, "transcode_progress")
-            job.error = f"Upload failed for profile {label}: {e}"
-            job.status = "failed"
-            db.commit()
+            api_patch_job(
+                job_id,
+                transcode_progress=progress,
+                error=f"Upload failed for profile {label}: {e}",
+                status="failed",
+            )
             raise
 
     # Append .plexmatch entries for all uploaded profiles
-    season = job.season
-    episode = job.episode
+    season = job["season"]
+    episode = job["episode"]
     plexmatch_entries = []
     for label, _, _ in PROFILES:
         if progress.get(label) == "uploaded":
@@ -584,7 +640,7 @@ def process_job(job_id: str, db: Session):
         try:
             resp = httpx.post(
                 f"{DIST_SERVER_URL}/plexmatch",
-                params={"path": job.dest_path},
+                params={"path": job["dest_path"]},
                 json={"entries": plexmatch_entries},
                 headers=dist_headers(),
             )
@@ -592,7 +648,7 @@ def process_job(job_id: str, db: Session):
                 get_dist_token()
                 resp = httpx.post(
                     f"{DIST_SERVER_URL}/plexmatch",
-                    params={"path": job.dest_path},
+                    params={"path": job["dest_path"]},
                     json={"entries": plexmatch_entries},
                     headers=dist_headers(),
                 )
@@ -601,17 +657,17 @@ def process_job(job_id: str, db: Session):
         except Exception as e:
             log.warning("Failed to update .plexmatch (non-fatal): %s", e)
 
-    job.status = "completed"
-    job.error = None
-    db.commit()
+    api_patch_job(job_id, status="completed", error=None)
     log.info("Job %s completed successfully", job_id)
 
-    # Clean up source upload file and the (now empty) transcoded job directory
-    try:
-        src_path.unlink(missing_ok=True)
-        log.info("Removed source upload file %s", src_path)
-    except OSError as e:
-        log.warning("Could not remove source file %s: %s", src_path, e)
+    # Clean up: remove downloaded S3 file (or legacy upload), then the job dir
+    file_to_remove = downloaded_path or (Path(job["upload_path"]) if job.get("upload_path") else None)
+    if file_to_remove:
+        try:
+            file_to_remove.unlink(missing_ok=True)
+            log.info("Removed source file %s", file_to_remove)
+        except OSError as e:
+            log.warning("Could not remove source file %s: %s", file_to_remove, e)
     try:
         job_transcode_dir = TRANSCODED_DIR / job_id
         if job_transcode_dir.exists():
@@ -628,36 +684,28 @@ def process_job(job_id: str, db: Session):
 
 def main():
     log.info("Transcoder worker starting…")
-    wait_for_db()
+    wait_for_backend()
     wait_for_dist_token()
-    log.info("Listening on queue '%s'", TRANSCODE_QUEUE)
+    log.info("Polling backend for jobs…")
     while True:
         try:
-            # Blocking pop with 5s timeout
-            result = rdb.blpop(TRANSCODE_QUEUE, timeout=5)
-            if result is None:
+            job_id = api_dequeue()
+            if not job_id:
+                time.sleep(5)
                 continue
-            _, job_id = result
             log.info("Picked up job: %s", job_id)
-            db = SessionLocal()
             try:
-                process_job(job_id, db)
+                process_job(job_id)
             except JobCancelledError:
                 log.info("Job %s was cancelled", job_id)
             except Exception as exc:
                 log.error("Job %s failed: %s", job_id, exc, exc_info=True)
                 try:
-                    job = db.query(JobModel).filter(JobModel.id == job_id).first()
-                    if job and job.status not in ("failed", "cancelled"):
-                        job.status = "failed"
-                        job.error = str(exc)
-                        db.commit()
+                    api_patch_job(job_id, status="failed", error=str(exc))
                 except Exception:
                     pass
-            finally:
-                db.close()
-        except redis.exceptions.ConnectionError as e:
-            log.error("Redis connection error: %s. Retrying in 5s...", e)
+        except httpx.HTTPError as e:
+            log.error("Backend connection error: %s. Retrying in 5s...", e)
             time.sleep(5)
         except Exception as e:
             log.error("Unexpected error: %s. Retrying in 5s...", e)

@@ -2,7 +2,7 @@
 Main Backend
 - Local authentication (JWT)
 - Job management (persisted in PostgreSQL)
-- Video upload receiving
+- S3 source file browsing and selection
 - Triggers transcoder worker via Redis queue
 """
 
@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 import redis as sync_redis
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
@@ -36,15 +38,35 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "changeme_in_production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8  # 8 hours
 
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/uploads"))
+# Token used by external transcoder workers to authenticate against /worker/* endpoints.
+# Must match WORKER_TOKEN in the transcoder's environment.
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+
 TRANSCODED_DIR = Path(os.environ.get("TRANSCODED_DIR", "/transcoded"))
 DIST_SERVER_URL = os.environ.get("DIST_SERVER_URL", "http://dist-server:8001")
 DIST_SERVICE_PASSWORD = os.environ.get("DIST_SERVICE_PASSWORD", "dist_service_password")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/plex")
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# S3 config
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")          # e.g. https://s3.amazonaws.com or MinIO URL
+S3_ACCESS_KEY   = os.environ.get("S3_ACCESS_KEY", "")
+S3_SECRET_KEY   = os.environ.get("S3_SECRET_KEY", "")
+S3_BUCKET       = os.environ.get("S3_BUCKET", "")
+S3_REGION       = os.environ.get("S3_REGION", "us-east-1")
+
 TRANSCODED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_s3_client():
+    kwargs = dict(
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY or None,
+        aws_secret_access_key=S3_SECRET_KEY or None,
+    )
+    if S3_ENDPOINT_URL:
+        kwargs["endpoint_url"] = S3_ENDPOINT_URL
+    return boto3.client("s3", **kwargs)
 
 # ---------------------------------------------------------------------------
 # Database
@@ -60,7 +82,8 @@ class JobModel(Base):
 
     id = Column(String, primary_key=True)
     original_filename = Column(String, nullable=False)
-    upload_path = Column(Text)
+    s3_key = Column(Text)            # S3 object key (source file)
+    upload_path = Column(Text)       # kept for backward compat (unused for new jobs)
     dest_path = Column(Text)
     season = Column(Integer)
     episode = Column(Integer)
@@ -116,6 +139,7 @@ def job_to_dict(job: JobModel) -> dict:
     return {
         "id": job.id,
         "original_filename": job.original_filename,
+        "s3_key": job.s3_key,
         "upload_path": job.upload_path,
         "dest_path": job.dest_path,
         "season": job.season,
@@ -204,6 +228,14 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class CreateJobRequest(BaseModel):
+    s3_key: str
+    dest_path: str
+    season: int
+    episode: int
+    target_codec: str = "hevc"
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -277,6 +309,112 @@ def change_password(
     user.hashed_password = pwd_context.hash(req.new_password)
     db.commit()
     return {"detail": "Password updated"}
+
+
+# ---------------------------------------------------------------------------
+# S3 routes
+# ---------------------------------------------------------------------------
+
+@app.get("/s3/browse")
+def s3_browse(
+    prefix: str = "",
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List objects and common prefixes (folders) in the S3 bucket."""
+    if not S3_BUCKET:
+        raise HTTPException(status_code=503, detail="S3 is not configured")
+    try:
+        s3 = get_s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
+        page = paginator.paginate(
+            Bucket=S3_BUCKET,
+            Prefix=prefix,
+            Delimiter="/",
+            PaginationConfig={"MaxItems": 500},
+        )
+        folders, files = [], []
+        for result in page:
+            for cp in result.get("CommonPrefixes") or []:
+                folders.append({"key": cp["Prefix"], "name": cp["Prefix"][len(prefix):].rstrip("/")})
+            for obj in result.get("Contents") or []:
+                key = obj["Key"]
+                if key == prefix:
+                    continue  # skip the folder marker itself
+                name = key[len(prefix):]
+                files.append({"key": key, "name": name, "size": obj["Size"], "last_modified": obj["LastModified"].isoformat()})
+        return {"bucket": S3_BUCKET, "prefix": prefix, "folders": folders, "files": files}
+    except (ClientError, NoCredentialsError) as e:
+        raise HTTPException(status_code=502, detail=f"S3 error: {e}")
+
+
+@app.post("/s3/probe")
+def s3_probe(
+    body: dict,
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Generate a presigned URL and run ffprobe directly against S3 — no download."""
+    s3_key = body.get("s3_key", "")
+    if not s3_key or not S3_BUCKET:
+        raise HTTPException(status_code=400, detail="s3_key and S3 config required")
+    try:
+        s3 = get_s3_client()
+        head = s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
+        file_size_bytes = head["ContentLength"]
+        presigned_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": s3_key},
+            ExpiresIn=300,
+        )
+    except (ClientError, NoCredentialsError) as e:
+        raise HTTPException(status_code=502, detail=f"S3 error: {e}")
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,bit_rate,avg_frame_rate,width,height",
+                "-show_entries", "format=bit_rate,duration",
+                "-of", "json",
+                presigned_url,
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=422, detail=f"ffprobe failed: {e.stderr[:200]}")
+
+    info: dict = {"file_size_bytes": file_size_bytes}
+    for stream in data.get("streams", []):
+        ctype = stream.get("codec_type")
+        if ctype == "video" and "video" not in info:
+            br_str = stream.get("bit_rate")
+            fps = None
+            try:
+                num, den = stream.get("avg_frame_rate", "0/0").split("/")
+                if int(den) > 0:
+                    fps = round(int(num) / int(den), 3)
+            except Exception:
+                pass
+            info["video"] = {
+                "codec": stream.get("codec_name", "unknown"),
+                "width": stream.get("width"),
+                "height": stream.get("height"),
+                "bitrate_kbps": int(br_str) // 1000 if br_str and br_str != "N/A" else None,
+                "fps": fps,
+            }
+        elif ctype == "audio" and "audio" not in info:
+            br_str = stream.get("bit_rate")
+            info["audio"] = {
+                "codec": stream.get("codec_name", "unknown"),
+                "bitrate_kbps": int(br_str) // 1000 if br_str and br_str != "N/A" else None,
+            }
+    fmt = data.get("format", {})
+    total_br = fmt.get("bit_rate")
+    info["total_bitrate_kbps"] = int(total_br) // 1000 if total_br and total_br != "N/A" else None
+    dur = fmt.get("duration")
+    info["duration_sec"] = round(float(dur), 1) if dur else None
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -362,43 +500,45 @@ def restart_job(
 
 
 # ---------------------------------------------------------------------------
-# Upload + job creation
+# Job creation (S3-based)
 # ---------------------------------------------------------------------------
 
 @app.post("/jobs")
-async def create_job(
-    dest_path: str = Form(..., description="Destination folder on dist-server (relative)"),
-    season: int = Form(..., description="Season number for .plexmatch"),
-    episode: int = Form(..., description="Episode number for .plexmatch"),
-    target_codec: str = Form("hevc", description="Target video codec: h264 or hevc"),
-    file: UploadFile = File(...),
+def create_job(
+    body: CreateJobRequest,
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if target_codec not in ("h264", "hevc"):
-        target_codec = "hevc"
+    if body.target_codec not in ("h264", "hevc"):
+        body.target_codec = "hevc"
+    if not S3_BUCKET:
+        raise HTTPException(status_code=503, detail="S3 is not configured")
+
+    # Verify the key exists in S3 before creating the job
+    try:
+        s3 = get_s3_client()
+        s3.head_object(Bucket=S3_BUCKET, Key=body.s3_key)
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("404", "NoSuchKey"):
+            raise HTTPException(status_code=404, detail=f"S3 key not found: {body.s3_key}")
+        raise HTTPException(status_code=502, detail=f"S3 error: {e}")
 
     job_id = str(uuid.uuid4())
-    original_filename = Path(file.filename).name  # sanitize
-    upload_path = UPLOAD_DIR / job_id / original_filename
-    upload_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Stream file to disk
-    async with aiofiles.open(upload_path, "wb") as out:
-        while chunk := await file.read(4 * 1024 * 1024):  # 4 MB chunks
-            await out.write(chunk)
+    original_filename = Path(body.s3_key).name
 
     job = JobModel(
         id=job_id,
         original_filename=original_filename,
-        upload_path=str(upload_path),
-        dest_path=dest_path,
-        season=season,
-        episode=episode,
+        s3_key=body.s3_key,
+        upload_path=None,
+        dest_path=body.dest_path,
+        season=body.season,
+        episode=body.episode,
         status="queued",
         created_at=datetime.now(timezone.utc).isoformat(),
         created_by=current_user.username,
-        target_codec=target_codec,
+        target_codec=body.target_codec,
         transcode_progress={},
         error=None,
     )
@@ -410,7 +550,7 @@ async def create_job(
 
 
 # ---------------------------------------------------------------------------
-# Video probe
+# Video probe (legacy local upload — kept for compatibility)
 # ---------------------------------------------------------------------------
 
 @app.post("/probe")
@@ -494,3 +634,92 @@ async def probe_file(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Worker API  (authenticated by WORKER_TOKEN, no user session needed)
+# ---------------------------------------------------------------------------
+
+worker_token_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
+
+
+def require_worker(token: str = Depends(worker_token_scheme)):
+    """Dependency that validates the shared WORKER_TOKEN Bearer header."""
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured on the server")
+    if token != WORKER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid worker token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+class WorkerJobUpdate(BaseModel):
+    """Partial job update sent by the transcoder worker."""
+    status: Optional[str] = None
+    transcode_progress: Optional[dict] = None
+    profile_bitrates: Optional[dict] = None
+    source_resolution: Optional[dict] = None
+    source_codec: Optional[str] = None
+    source_bitrate: Optional[int] = None
+    source_fps: Optional[float] = None
+    source_file_size: Optional[int] = None
+    error: Optional[str] = None
+
+
+@app.post("/worker/dequeue")
+def worker_dequeue(
+    _: None = Depends(require_worker),
+    db: Session = Depends(get_db),
+):
+    """Pop the next job_id from the Redis queue. Returns {job_id} or {job_id: null}."""
+    job_id = rdb.lpop(TRANSCODE_QUEUE)
+    if not job_id:
+        return {"job_id": None}
+    # Verify job exists and is still queued
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        return {"job_id": None}
+    return {"job_id": job_id}
+
+
+@app.get("/worker/jobs/{job_id}")
+def worker_get_job(
+    job_id: str,
+    _: None = Depends(require_worker),
+    db: Session = Depends(get_db),
+):
+    """Return full job details for the worker."""
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job_to_dict(job)
+
+
+@app.patch("/worker/jobs/{job_id}")
+def worker_patch_job(
+    job_id: str,
+    body: WorkerJobUpdate,
+    _: None = Depends(require_worker),
+    db: Session = Depends(get_db),
+):
+    """Partial update of a job from the transcoder worker."""
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    updates = body.model_dump(exclude_unset=True)
+    for key, val in updates.items():
+        setattr(job, key, val)
+    db.commit()
+    return job_to_dict(job)
+
+
+@app.get("/worker/jobs/{job_id}/cancelled")
+def worker_is_cancelled(
+    job_id: str,
+    _: None = Depends(require_worker),
+):
+    """Check whether the cancel flag is set for a job (set by POST /jobs/{id}/stop)."""
+    cancelled = bool(rdb.exists(f"cancel:{job_id}"))
+    return {"cancelled": cancelled}
