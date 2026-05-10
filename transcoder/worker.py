@@ -147,18 +147,28 @@ PROFILES = [
 # A source that already matches the target codec AND falls within this range
 # will be stream-copied rather than re-encoded.
 BITRATE_RANGES: dict[str, dict[str, tuple[int, int]]] = {
+    # Ranges are ±25% around the target so that (lo+hi)/2 == target.
+    # Stream-copy is used when the source codec matches and its bitrate falls within [lo, hi].
     "h264": {
-        "480p":  (1_500_000,   3_000_000),
-        "720p":  (4_000_000,   8_000_000),
-        "1080p": (8_000_000,  16_000_000),
-        "4k":   (35_000_000,  68_000_000),
+        "480p":  (1_125_000,   1_875_000),   # target 1.5 Mbps
+        "720p":  (2_250_000,   3_750_000),   # target 3 Mbps
+        "1080p": (4_500_000,   7_500_000),   # target 6 Mbps
+        "4k":   (13_500_000,  22_500_000),   # target 18 Mbps
     },
     "hevc": {
-        "480p":  (1_000_000,   2_000_000),
-        "720p":  (2_500_000,   5_000_000),
-        "1080p": (4_000_000,  10_000_000),
-        "4k":   (15_000_000,  35_000_000),
+        "480p":    (750_000,   1_250_000),   # target 1 Mbps
+        "720p":  (1_500_000,   2_500_000),   # target 2 Mbps
+        "1080p": (3_000_000,   5_000_000),   # target 4 Mbps
+        "4k":    (9_000_000,  15_000_000),   # target 12 Mbps
     },
+}
+
+# Output codec per profile — overrides the job-level target_codec.
+PROFILE_CODEC: dict[str, str] = {
+    "480p":  "h264",
+    "720p":  "h264",
+    "1080p": "hevc",
+    "4k":    "hevc",
 }
 
 # ffprobe codec_name → our internal key used in BITRATE_RANGES
@@ -548,15 +558,16 @@ def process_job(job_id: str) -> None:
         out_path = TRANSCODED_DIR / job_id / out_filename
 
         # Transcode if not already done
-        use_copy = should_copy(src_info, label, prof_height, target_codec)
+        profile_codec = PROFILE_CODEC.get(label, target_codec)
+        use_copy = should_copy(src_info, label, prof_height, profile_codec)
         if progress.get(label) != "transcoded" or not out_path.exists():
             progress[label] = "transcoding"
             api_patch_job(job_id, transcode_progress=progress)
             try:
-                bitrate_range = BITRATE_RANGES.get(target_codec, {}).get(label, (0, 0))
+                bitrate_range = BITRATE_RANGES.get(profile_codec, {}).get(label, (0, 0))
                 transcode(
                     src_path, out_path, prof_width, prof_height,
-                    target_codec=target_codec, use_copy=use_copy,
+                    target_codec=profile_codec, use_copy=use_copy,
                     bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
                     cancel_flag=is_cancelled,
                 )
