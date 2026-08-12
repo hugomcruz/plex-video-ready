@@ -3,7 +3,9 @@ Transcoder Worker
 - Polls Redis queue for job IDs
 - Downloads source file from S3
 - Uses ffprobe to detect source resolution, codec, and bitrate
-- Transcodes to required profiles (only downscaling)
+- Transcodes a single profile matching the source's own resolution, at a
+  bitrate/codec chosen from an encoding matrix keyed by resolution, fps,
+  and source codec (4K is always HEVC; other resolutions keep the source codec)
 - Stream-copies when source already meets target codec + bitrate range
 - Uploads each transcoded file to dist-server via multipart upload
 - Tracks per-profile progress in PostgreSQL so failures can be resumed
@@ -143,43 +145,69 @@ PROFILES = [
     ("480p",  854,  480),
 ]
 
-# Target bitrate ranges in bits/sec (min, max) per codec per profile label.
-# A source that already matches the target codec AND falls within this range
-# will be stream-copied rather than re-encoded.
-BITRATE_RANGES: dict[str, dict[str, tuple[int, int]]] = {
-    # Ranges are ±25% around the target so that (lo+hi)/2 == target.
-    # Stream-copy is used when the source codec matches and its bitrate falls within [lo, hi].
-    "h264": {
-        "480p":  (1_125_000,   1_875_000),   # target 1.5 Mbps
-        "720p":  (2_250_000,   3_750_000),   # target 3 Mbps
-        "1080p": (4_500_000,   7_500_000),   # target 6 Mbps
-        "4k":   (13_500_000,  22_500_000),   # target 18 Mbps
-    },
-    "hevc": {
-        "480p":    (750_000,   1_250_000),   # target 1 Mbps
-        "720p":  (1_500_000,   2_500_000),   # target 2 Mbps
-        "1080p": (3_000_000,   5_000_000),   # target 4 Mbps
-        "4k":    (9_000_000,  15_000_000),   # target 12 Mbps
-    },
+# Target bitrate in kbps per resolution profile / fps bucket / codec, per the
+# encoding matrix. The codec here is both the source AND output codec: HEVC
+# sources stay HEVC, H.264 sources stay H.264 (see resolve_target_codec).
+# 4K has no H.264 row — 4K sources are always forced to HEVC regardless of
+# their source codec.
+BITRATE_MATRIX_KBPS: dict[str, dict[int, dict[str, int]]] = {
+    "4k":    {60: {"hevc": 35_000}, 30: {"hevc": 25_000}},
+    "1080p": {60: {"hevc": 6_000, "h264": 9_000}, 30: {"hevc": 4_500, "h264": 6_000}},
+    "720p":  {60: {"hevc": 3_500, "h264": 5_000}, 30: {"hevc": 2_500, "h264": 4_000}},
+    "480p":  {60: {"hevc": 1_800, "h264": 2_500}, 30: {"hevc": 1_200, "h264": 2_000}},
 }
 
-# Output codec per profile — overrides the job-level target_codec.
-PROFILE_CODEC: dict[str, str] = {
-    "480p":  "h264",
-    "720p":  "h264",
-    "1080p": "hevc",
-    "4k":    "hevc",
-}
-
-# ffprobe codec_name → our internal key used in BITRATE_RANGES
+# ffprobe codec_name → our internal key used in the bitrate matrix
 CODEC_MAP: dict[str, str] = {
     "h264": "h264",
     "hevc": "hevc",
     "h265": "hevc",
 }
 
-# The codec we transcode TO (must be a key in BITRATE_RANGES)
-TARGET_CODEC = "h264"
+# Fallback output codec for source codecs outside the matrix (e.g. VP9, AV1,
+# MPEG-2): resolved per-profile by resolve_target_codec (4K -> HEVC, else H264).
+FALLBACK_CODEC = "h264"
+
+
+def fps_bucket(fps: float | None) -> int:
+    """Bucket a source fps into the matrix's 30/60 rows.
+
+    This only selects which bitrate-matrix row to use — the output frame
+    rate always matches the source exactly (ffmpeg performs no fps
+    conversion here).
+    """
+    return 60 if fps and fps > 30 else 30
+
+
+def resolve_target_codec(label: str, src_codec_key: str | None) -> str:
+    """Pick the output codec for a profile per the encoding matrix.
+
+    4K is always encoded as HEVC. Other resolutions keep the source's own
+    codec when it's H.264 or HEVC; any other/unknown source codec falls
+    back to FALLBACK_CODEC.
+    """
+    if label == "4k":
+        return "hevc"
+    if src_codec_key in ("h264", "hevc"):
+        return src_codec_key
+    return FALLBACK_CODEC
+
+
+def target_bitrate_range(label: str, fps: float | None, codec: str) -> tuple[int, int]:
+    """Return (lo, hi) bits/sec = matrix target ±25% for this profile/fps/codec.
+
+    Falls back to the other fps bucket if the exact one has no entry for
+    this codec (e.g. a 720p H.264 source has no matching column at 4K).
+    """
+    bucket = fps_bucket(fps)
+    by_bucket = BITRATE_MATRIX_KBPS.get(label, {})
+    target_kbps = by_bucket.get(bucket, {}).get(codec)
+    if target_kbps is None:
+        target_kbps = by_bucket.get(60 if bucket == 30 else 30, {}).get(codec)
+    if target_kbps is None:
+        raise KeyError(f"No bitrate matrix entry for {label}/{codec}")
+    target_bps = target_kbps * 1000
+    return int(target_bps * 0.75), int(target_bps * 1.25)
 
 
 
@@ -278,7 +306,7 @@ def should_copy(src_info: dict, label: str, prof_height: int, target_codec: str)
     bitrate = src_info["bitrate"]
     if bitrate is None:
         return False
-    lo, hi = BITRATE_RANGES[target_codec][label]
+    lo, hi = target_bitrate_range(label, src_info["fps"], target_codec)
     return lo <= bitrate <= hi
 
 
@@ -531,9 +559,16 @@ def process_job(job_id: str) -> None:
         source_file_size=src_path.stat().st_size,
     )
 
-    target_codec = job.get("target_codec") or TARGET_CODEC
     progress: dict = dict(job.get("transcode_progress") or {})
     profile_bitrates: dict = dict(job.get("profile_bitrates") or {})
+
+    # Only keep a single rendition, matching the source's own resolution
+    # (never upscale — pick the highest profile bucket at or below the
+    # source height). PROFILES is ordered highest-to-lowest resolution.
+    target_label = next(
+        (label for label, _, prof_height in PROFILES if prof_height <= src_height),
+        None,
+    )
 
     for label, prof_width, prof_height in PROFILES:
         # Check for cancellation before starting each profile
@@ -542,9 +577,8 @@ def process_job(job_id: str) -> None:
             api_patch_job(job_id, status="cancelled")
             raise JobCancelledError("Job cancelled by user")
 
-        # Never upscale
-        if prof_height > src_height:
-            log.info("Skipping %s (source %dp < target %dp)", label, src_height, prof_height)
+        if label != target_label:
+            log.info("Skipping %s (keeping only source-matching resolution %s)", label, target_label)
             progress[label] = "skipped"
             api_patch_job(job_id, transcode_progress=progress)
             continue
@@ -558,13 +592,13 @@ def process_job(job_id: str) -> None:
         out_path = TRANSCODED_DIR / job_id / out_filename
 
         # Transcode if not already done
-        profile_codec = PROFILE_CODEC.get(label, target_codec)
+        profile_codec = resolve_target_codec(label, CODEC_MAP.get(src_info["codec"]))
         use_copy = should_copy(src_info, label, prof_height, profile_codec)
         if progress.get(label) != "transcoded" or not out_path.exists():
             progress[label] = "transcoding"
             api_patch_job(job_id, transcode_progress=progress)
             try:
-                bitrate_range = BITRATE_RANGES.get(profile_codec, {}).get(label, (0, 0))
+                bitrate_range = target_bitrate_range(label, src_info["fps"], profile_codec)
                 transcode(
                     src_path, out_path, prof_width, prof_height,
                     target_codec=profile_codec, use_copy=use_copy,
