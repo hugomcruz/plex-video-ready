@@ -35,7 +35,12 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
     onRefresh();
   }
 
-  const profiles = ["4k", "1080p", "720p", "480p"];
+  // The worker only ever transcodes one profile (matching the source's own
+  // resolution) and marks the rest "skipped" — find that one active profile.
+  const activeProfile = Object.entries(job.transcode_progress ?? {}).find(
+    ([, status]) => status !== "skipped"
+  );
+  const [activeLabel, activeStatus] = activeProfile ?? [undefined, undefined];
 
   return (
     <div
@@ -58,23 +63,24 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
         </div>
       </div>
 
-      {/* Profile badges */}
-      <div className="flex gap-2 mt-3 flex-wrap">
-        {profiles.map((p) => {
-          const st = job.transcode_progress?.[p];
-          const badge =
-            st === "uploaded" ? "bg-green-900 text-green-300" :
-            st === "transcoded" ? "bg-indigo-900 text-indigo-300" :
-            st === "transcoding" ? "bg-yellow-900 text-yellow-300" :
-            st === "skipped" ? "bg-gray-800 text-gray-500" :
-            st === "failed" || st === "upload_failed" ? "bg-red-900 text-red-300" :
-            "bg-gray-800 text-gray-600";
-          return (
-            <span key={p} className={`text-xs px-2 py-0.5 rounded-full font-mono ${badge}`}>
-              {p}
-            </span>
-          );
-        })}
+      {/* Resolution: generic status while in progress, final resolution once done */}
+      <div className="mt-3">
+        {activeStatus === "uploaded" ? (
+          <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-green-900 text-green-300">
+            {activeLabel}
+          </span>
+        ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
+          <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-red-900 text-red-300">
+            {activeLabel} failed
+          </span>
+        ) : activeLabel ? (
+          <span className="flex items-center gap-1.5 text-xs text-gray-400">
+            <Loader2 size={12} className="animate-spin" />
+            {activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
+          </span>
+        ) : (
+          <span className="text-xs text-gray-500">Queued</span>
+        )}
       </div>
 
       {job.error && (

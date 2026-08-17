@@ -12,15 +12,8 @@ const PROFILE_LABEL: Record<string, string> = {
   "480p": "480p",
 };
 
-const STATUS_COLOR: Record<string, string> = {
-  uploaded: "text-blue-400 bg-blue-900/30",
-  transcoding: "text-yellow-400 bg-yellow-900/30",
-  transcoded: "text-indigo-400 bg-indigo-900/30",
-  uploading: "text-cyan-400 bg-cyan-900/30",
+const STATUS_COLOR = {
   uploaded_profile: "text-green-400 bg-green-900/30",
-  skipped: "text-gray-500 bg-gray-800",
-  failed: "text-red-400 bg-red-900/30",
-  upload_failed: "text-red-400 bg-red-900/30",
 };
 
 const RESOLUTION_COLORS: Record<string, string> = {
@@ -99,7 +92,14 @@ export default function JobDetailPage() {
 
   if (!job) return <Layout><div className="p-8 text-gray-500">Loading…</div></Layout>;
 
-  const profiles = ["4k", "1080p", "720p", "480p"];
+  // The worker only ever transcodes one profile (matching the source's own
+  // resolution) and marks the rest "skipped" — find that one active profile.
+  const activeProfile = Object.entries(job.transcode_progress ?? {}).find(
+    ([, status]) => status !== "skipped"
+  );
+  const [activeLabel, activeStatus] = activeProfile ?? [undefined, undefined];
+  const activeInfo: ProfileMediaInfo | undefined = activeLabel ? job.profile_bitrates?.[activeLabel] : undefined;
+  const activeOpen = activeLabel ? openProfiles.has(activeLabel) : false;
 
   // Group plexmatch entries this job contributed (match by dest_path + season/episode)
   const jobSeason  = (job as any).season  as number | undefined;
@@ -204,78 +204,83 @@ export default function JobDetailPage() {
           </div>
         )}
 
-        {/* Transcode profiles */}
+        {/* Transcode result: generic status while in progress, final resolution once done */}
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Transcode Profiles</h3>
-          <div className="space-y-2">
-            {profiles.map((p) => {
-              const st = job.transcode_progress?.[p] ?? "pending";
-              const colorClass = STATUS_COLOR[st === "uploaded" ? "uploaded_profile" : st] ?? "text-gray-400 bg-gray-800/30";
-              const info: ProfileMediaInfo | undefined = job.profile_bitrates?.[p];
-              const isOpen = openProfiles.has(p);
-              return (
-                <div key={p} className="bg-gray-800 rounded-lg px-3 py-2 space-y-1.5">
-                  <button
-                    type="button"
-                    onClick={() => info && toggleProfile(p)}
-                    className={`w-full flex items-center justify-between ${info ? "cursor-pointer" : "cursor-default"}`}
-                  >
-                    <div className="flex items-center gap-2">
-                      {info && (isOpen ? <ChevronDown size={12} className="text-gray-500" /> : <ChevronRight size={12} className="text-gray-500" />)}
-                      <span className="text-xs font-semibold text-gray-300">{PROFILE_LABEL[p]}</span>
-                    </div>
-                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${colorClass}`}>
-                      {st === "uploaded" ? "done" : st || "pending"}
-                    </span>
-                  </button>
-                  {info && isOpen && (
-                    <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[10px] border-t border-gray-700 pt-1.5">
-                      {info.video && (
-                        <>
-                          <span className="text-gray-500">Video codec</span>
-                          <span className="text-gray-300 font-mono">{info.video.codec}</span>
-                          <span className="text-gray-500">Video bitrate</span>
-                          <span className="text-gray-300 font-mono">
-                            {info.video.bitrate_kbps != null ? `${info.video.bitrate_kbps} kbps` : "—"}
-                          </span>
-                          <span className="text-gray-500">Frame rate</span>
-                          <span className="text-gray-300 font-mono">
-                            {info.video.fps != null ? `${info.video.fps} fps` : "—"}
-                          </span>
-                        </>
-                      )}
-                      {info.audio && (
-                        <>
-                          <span className="text-gray-500">Audio codec</span>
-                          <span className="text-gray-300 font-mono">{info.audio.codec}</span>
-                          <span className="text-gray-500">Audio bitrate</span>
-                          <span className="text-gray-300 font-mono">
-                            {info.audio.bitrate_kbps != null ? `${info.audio.bitrate_kbps} kbps` : "—"}
-                          </span>
-                        </>
-                      )}
-                      {info.total_bitrate_kbps != null && (
-                        <>
-                          <span className="text-gray-500">Total bitrate</span>
-                          <span className="text-gray-300 font-mono">{info.total_bitrate_kbps} kbps</span>
-                        </>
-                      )}
-                      {info.file_size_bytes != null && (
-                        <>
-                          <span className="text-gray-500">File size</span>
-                          <span className="text-gray-300 font-mono">
-                            {info.file_size_bytes >= 1_073_741_824
-                              ? `${(info.file_size_bytes / 1_073_741_824).toFixed(2)} GB`
-                              : `${(info.file_size_bytes / 1_048_576).toFixed(1)} MB`}
-                          </span>
-                        </>
-                      )}
-                    </div>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Transcode</h3>
+          {!activeLabel ? (
+            <p className="text-xs text-gray-500">Queued</p>
+          ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
+            <div className="flex items-center gap-2 text-xs text-red-400">
+              <AlertCircle size={13} /> {PROFILE_LABEL[activeLabel] ?? activeLabel} failed
+            </div>
+          ) : activeStatus !== "uploaded" ? (
+            <div className="flex items-center gap-2 text-xs text-gray-400">
+              <Loader2 size={13} className="animate-spin" />
+              {activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
+            </div>
+          ) : (
+            <div className="bg-gray-800 rounded-lg px-3 py-2 space-y-1.5">
+              <button
+                type="button"
+                onClick={() => activeInfo && toggleProfile(activeLabel)}
+                className={`w-full flex items-center justify-between ${activeInfo ? "cursor-pointer" : "cursor-default"}`}
+              >
+                <div className="flex items-center gap-2">
+                  {activeInfo && (activeOpen ? <ChevronDown size={12} className="text-gray-500" /> : <ChevronRight size={12} className="text-gray-500" />)}
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${RESOLUTION_COLORS[activeLabel] ?? "bg-gray-800 text-gray-400"}`}>
+                    {PROFILE_LABEL[activeLabel] ?? activeLabel}
+                  </span>
+                </div>
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLOR.uploaded_profile}`}>
+                  done
+                </span>
+              </button>
+              {activeInfo && activeOpen && (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[10px] border-t border-gray-700 pt-1.5">
+                  {activeInfo.video && (
+                    <>
+                      <span className="text-gray-500">Video codec</span>
+                      <span className="text-gray-300 font-mono">{activeInfo.video.codec}</span>
+                      <span className="text-gray-500">Video bitrate</span>
+                      <span className="text-gray-300 font-mono">
+                        {activeInfo.video.bitrate_kbps != null ? `${activeInfo.video.bitrate_kbps} kbps` : "—"}
+                      </span>
+                      <span className="text-gray-500">Frame rate</span>
+                      <span className="text-gray-300 font-mono">
+                        {activeInfo.video.fps != null ? `${activeInfo.video.fps} fps` : "—"}
+                      </span>
+                    </>
+                  )}
+                  {activeInfo.audio && (
+                    <>
+                      <span className="text-gray-500">Audio codec</span>
+                      <span className="text-gray-300 font-mono">{activeInfo.audio.codec}</span>
+                      <span className="text-gray-500">Audio bitrate</span>
+                      <span className="text-gray-300 font-mono">
+                        {activeInfo.audio.bitrate_kbps != null ? `${activeInfo.audio.bitrate_kbps} kbps` : "—"}
+                      </span>
+                    </>
+                  )}
+                  {activeInfo.total_bitrate_kbps != null && (
+                    <>
+                      <span className="text-gray-500">Total bitrate</span>
+                      <span className="text-gray-300 font-mono">{activeInfo.total_bitrate_kbps} kbps</span>
+                    </>
+                  )}
+                  {activeInfo.file_size_bytes != null && (
+                    <>
+                      <span className="text-gray-500">File size</span>
+                      <span className="text-gray-300 font-mono">
+                        {activeInfo.file_size_bytes >= 1_073_741_824
+                          ? `${(activeInfo.file_size_bytes / 1_073_741_824).toFixed(2)} GB`
+                          : `${(activeInfo.file_size_bytes / 1_048_576).toFixed(1)} MB`}
+                      </span>
+                    </>
                   )}
                 </div>
-              );
-            })}
-          </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* .plexmatch entries for this job */}
