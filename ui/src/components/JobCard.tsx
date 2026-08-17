@@ -65,18 +65,22 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
 
       {/* Resolution: generic status while in progress, final resolution once done */}
       <div className="mt-3">
-        {activeStatus === "uploaded" ? (
+        {activeStatus === "uploaded" && activeLabel === "original" ? (
+          <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-amber-900 text-amber-300">
+            Copied as-is (non-standard resolution)
+          </span>
+        ) : activeStatus === "uploaded" ? (
           <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-green-900 text-green-300">
             {activeLabel}
           </span>
         ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
           <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-red-900 text-red-300">
-            {activeLabel} failed
+            {activeLabel === "original" ? "Copy failed" : `${activeLabel} failed`}
           </span>
         ) : activeLabel ? (
           <span className="flex items-center gap-1.5 text-xs text-gray-400">
             <Loader2 size={12} className="animate-spin" />
-            {activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
+            {activeLabel === "original" ? "Copying…" : activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
           </span>
         ) : (
           <span className="text-xs text-gray-500">Queued</span>

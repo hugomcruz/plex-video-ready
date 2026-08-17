@@ -179,13 +179,16 @@ def fps_bucket(fps: float | None) -> int:
     return 60 if fps and fps > 30 else 30
 
 
-def resolve_target_codec(label: str, src_codec_key: str | None) -> str:
+def resolve_target_codec(label: str, src_codec_key: str | None, override: str | None = None) -> str:
     """Pick the output codec for a profile per the encoding matrix.
 
-    4K is always encoded as HEVC. Other resolutions keep the source's own
-    codec when it's H.264 or HEVC; any other/unknown source codec falls
-    back to FALLBACK_CODEC.
+    An explicit override (the job's target_codec field, set via the UI's
+    "override codec" checkbox) always wins. Otherwise: 4K is always encoded
+    as HEVC; other resolutions keep the source's own codec when it's H.264
+    or HEVC; any other/unknown source codec falls back to FALLBACK_CODEC.
     """
+    if override in ("h264", "hevc"):
+        return override
     if label == "4k":
         return "hevc"
     if src_codec_key in ("h264", "hevc"):
@@ -198,12 +201,19 @@ def target_bitrate_range(label: str, fps: float | None, codec: str) -> tuple[int
 
     Falls back to the other fps bucket if the exact one has no entry for
     this codec (e.g. a 720p H.264 source has no matching column at 4K).
+    If the codec still isn't found (e.g. an explicit H.264 override at 4K,
+    which the matrix only defines for HEVC), falls back to whatever codec
+    IS defined for that resolution/fps as an approximate target.
     """
     bucket = fps_bucket(fps)
+    other_bucket = 60 if bucket == 30 else 30
     by_bucket = BITRATE_MATRIX_KBPS.get(label, {})
     target_kbps = by_bucket.get(bucket, {}).get(codec)
     if target_kbps is None:
-        target_kbps = by_bucket.get(60 if bucket == 30 else 30, {}).get(codec)
+        target_kbps = by_bucket.get(other_bucket, {}).get(codec)
+    if target_kbps is None:
+        fallback_row = by_bucket.get(bucket) or by_bucket.get(other_bucket) or {}
+        target_kbps = next(iter(fallback_row.values()), None)
     if target_kbps is None:
         raise KeyError(f"No bitrate matrix entry for {label}/{codec}")
     target_bps = target_kbps * 1000
@@ -562,119 +572,165 @@ def process_job(job_id: str) -> None:
     progress: dict = dict(job.get("transcode_progress") or {})
     profile_bitrates: dict = dict(job.get("profile_bitrates") or {})
 
-    # Only keep a single rendition, matching the source's own resolution
-    # (never upscale — pick the highest profile bucket at or below the
-    # source height). PROFILES is ordered highest-to-lowest resolution.
-    target_label = next(
-        (label for label, _, prof_height in PROFILES if prof_height <= src_height),
-        None,
-    )
+    STANDARD_HEIGHTS = {prof_height for _, _, prof_height in PROFILES}
 
-    for label, prof_width, prof_height in PROFILES:
-        # Check for cancellation before starting each profile
+    if src_height not in STANDARD_HEIGHTS:
+        # Non-standard source resolution: forcing it into a standard
+        # bucket's canvas (e.g. padding/cropping to exactly 1280x720) would
+        # distort it for no benefit now that we only keep one rendition
+        # anyway. Copy the original file through untouched and flag it
+        # ("original") so the UI can highlight that no transcoding happened.
+        log.info(
+            "Source resolution %dx%d is non-standard — copying original file as-is",
+            src_width, src_height,
+        )
+        label = "original"
         if is_cancelled():
-            log.info("Job %s cancelled before profile %s", job_id, label)
             api_patch_job(job_id, status="cancelled")
             raise JobCancelledError("Job cancelled by user")
 
-        if label != target_label:
-            log.info("Skipping %s (keeping only source-matching resolution %s)", label, target_label)
-            progress[label] = "skipped"
+        if progress.get(label) != "uploaded":
+            progress[label] = "uploading"
             api_patch_job(job_id, transcode_progress=progress)
-            continue
-
-        # Skip already completed profiles (resume support)
-        if progress.get(label) == "uploaded":
-            log.info("Profile %s already uploaded, skipping", label)
-            continue
-
-        out_filename = f"{stem}_{label}{suffix}"
-        out_path = TRANSCODED_DIR / job_id / out_filename
-
-        # Transcode if not already done
-        profile_codec = resolve_target_codec(label, CODEC_MAP.get(src_info["codec"]))
-        use_copy = should_copy(src_info, label, prof_height, profile_codec)
-        if progress.get(label) != "transcoded" or not out_path.exists():
-            progress[label] = "transcoding"
-            api_patch_job(job_id, transcode_progress=progress)
+            out_info = get_output_file_info(src_path)
+            if out_info:
+                profile_bitrates[label] = out_info
+                api_patch_job(job_id, profile_bitrates=profile_bitrates)
             try:
-                bitrate_range = target_bitrate_range(label, src_info["fps"], profile_codec)
-                transcode(
-                    src_path, out_path, prof_width, prof_height,
-                    target_codec=profile_codec, use_copy=use_copy,
-                    bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
-                    cancel_flag=is_cancelled,
-                )
-
-                # Probe and log output file info (codec, bitrate, fps)
-                out_info = get_output_file_info(out_path)
-                if out_info:
-                    v = out_info.get("video", {})
-                    a = out_info.get("audio", {})
-                    log.info(
-                        "Profile %s output (%s): "
-                        "video=%s %s kbps @ %s fps | "
-                        "audio=%s %s kbps | total=%s kbps",
-                        label,
-                        "stream copy" if use_copy else "encoded",
-                        v.get("codec", "?"),
-                        v.get("bitrate_kbps", "?"),
-                        v.get("fps", "?"),
-                        a.get("codec", "?"),
-                        a.get("bitrate_kbps", "?"),
-                        out_info.get("total_bitrate_kbps", "?"),
-                    )
-                    profile_bitrates[label] = out_info
-                    api_patch_job(job_id, profile_bitrates=profile_bitrates)
-                else:
-                    log.warning("Profile %s output info: unknown", label)
-
-                progress[label] = "transcoded"
+                remote_dest = f"{dest_folder}/{job['original_filename']}"
+                upload_to_dist(src_path, remote_dest)
+                progress[label] = "uploaded"
                 api_patch_job(job_id, transcode_progress=progress)
-                log.info("Transcoded %s → %s", label, out_path)
-            except JobCancelledError:
-                progress[label] = "cancelled"
-                api_patch_job(job_id, transcode_progress=progress, status="cancelled")
-                raise
-            except subprocess.CalledProcessError as e:
-                progress[label] = "failed"
+                log.info("Uploaded original file to dist-server at %s", remote_dest)
+            except Exception as e:
+                progress[label] = "upload_failed"
                 api_patch_job(
                     job_id,
                     transcode_progress=progress,
-                    error=f"FFmpeg failed on profile {label}: {e}",
+                    error=f"Upload failed for original file: {e}",
                     status="failed",
                 )
                 raise
+    else:
+        # Only keep a single rendition, matching the source's own resolution
+        # (never upscale — pick the highest profile bucket at or below the
+        # source height). PROFILES is ordered highest-to-lowest resolution.
+        target_label = next(
+            (label for label, _, prof_height in PROFILES if prof_height <= src_height),
+            None,
+        )
 
-        # Upload to dist-server
-        progress[label] = "uploading"
-        api_patch_job(job_id, transcode_progress=progress)
-        try:
-            remote_dest = f"{dest_folder}/{out_filename}"
-            upload_to_dist(out_path, remote_dest)
-            progress[label] = "uploaded"
-            api_patch_job(job_id, transcode_progress=progress)
-            log.info("Uploaded %s to dist-server at %s", out_filename, remote_dest)
-            # Remove the transcoded file now that it's safely on the dist-server
-            try:
-                out_path.unlink(missing_ok=True)
-                log.info("Removed local transcoded file %s", out_path)
-            except OSError as cleanup_err:
-                log.warning("Could not remove transcoded file %s: %s", out_path, cleanup_err)
-        except Exception as e:
-            progress[label] = "upload_failed"
-            api_patch_job(
-                job_id,
-                transcode_progress=progress,
-                error=f"Upload failed for profile {label}: {e}",
-                status="failed",
+        for label, prof_width, prof_height in PROFILES:
+            # Check for cancellation before starting each profile
+            if is_cancelled():
+                log.info("Job %s cancelled before profile %s", job_id, label)
+                api_patch_job(job_id, status="cancelled")
+                raise JobCancelledError("Job cancelled by user")
+
+            if label != target_label:
+                log.info("Skipping %s (keeping only source-matching resolution %s)", label, target_label)
+                progress[label] = "skipped"
+                api_patch_job(job_id, transcode_progress=progress)
+                continue
+
+            # Skip already completed profiles (resume support)
+            if progress.get(label) == "uploaded":
+                log.info("Profile %s already uploaded, skipping", label)
+                continue
+
+            out_filename = f"{stem}_{label}{suffix}"
+            out_path = TRANSCODED_DIR / job_id / out_filename
+
+            # Transcode if not already done
+            profile_codec = resolve_target_codec(
+                label, CODEC_MAP.get(src_info["codec"]), override=job.get("target_codec")
             )
-            raise
+            use_copy = should_copy(src_info, label, prof_height, profile_codec)
+            if progress.get(label) != "transcoded" or not out_path.exists():
+                progress[label] = "transcoding"
+                api_patch_job(job_id, transcode_progress=progress)
+                try:
+                    bitrate_range = target_bitrate_range(label, src_info["fps"], profile_codec)
+                    transcode(
+                        src_path, out_path, prof_width, prof_height,
+                        target_codec=profile_codec, use_copy=use_copy,
+                        bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
+                        cancel_flag=is_cancelled,
+                    )
+
+                    # Probe and log output file info (codec, bitrate, fps)
+                    out_info = get_output_file_info(out_path)
+                    if out_info:
+                        v = out_info.get("video", {})
+                        a = out_info.get("audio", {})
+                        log.info(
+                            "Profile %s output (%s): "
+                            "video=%s %s kbps @ %s fps | "
+                            "audio=%s %s kbps | total=%s kbps",
+                            label,
+                            "stream copy" if use_copy else "encoded",
+                            v.get("codec", "?"),
+                            v.get("bitrate_kbps", "?"),
+                            v.get("fps", "?"),
+                            a.get("codec", "?"),
+                            a.get("bitrate_kbps", "?"),
+                            out_info.get("total_bitrate_kbps", "?"),
+                        )
+                        profile_bitrates[label] = out_info
+                        api_patch_job(job_id, profile_bitrates=profile_bitrates)
+                    else:
+                        log.warning("Profile %s output info: unknown", label)
+
+                    progress[label] = "transcoded"
+                    api_patch_job(job_id, transcode_progress=progress)
+                    log.info("Transcoded %s → %s", label, out_path)
+                except JobCancelledError:
+                    progress[label] = "cancelled"
+                    api_patch_job(job_id, transcode_progress=progress, status="cancelled")
+                    raise
+                except subprocess.CalledProcessError as e:
+                    progress[label] = "failed"
+                    api_patch_job(
+                        job_id,
+                        transcode_progress=progress,
+                        error=f"FFmpeg failed on profile {label}: {e}",
+                        status="failed",
+                    )
+                    raise
+
+            # Upload to dist-server
+            progress[label] = "uploading"
+            api_patch_job(job_id, transcode_progress=progress)
+            try:
+                remote_dest = f"{dest_folder}/{out_filename}"
+                upload_to_dist(out_path, remote_dest)
+                progress[label] = "uploaded"
+                api_patch_job(job_id, transcode_progress=progress)
+                log.info("Uploaded %s to dist-server at %s", out_filename, remote_dest)
+                # Remove the transcoded file now that it's safely on the dist-server
+                try:
+                    out_path.unlink(missing_ok=True)
+                    log.info("Removed local transcoded file %s", out_path)
+                except OSError as cleanup_err:
+                    log.warning("Could not remove transcoded file %s: %s", out_path, cleanup_err)
+            except Exception as e:
+                progress[label] = "upload_failed"
+                api_patch_job(
+                    job_id,
+                    transcode_progress=progress,
+                    error=f"Upload failed for profile {label}: {e}",
+                    status="failed",
+                )
+                raise
 
     # Append .plexmatch entries for all uploaded profiles
     season = job["season"]
     episode = job["episode"]
     plexmatch_entries = []
+    if progress.get("original") == "uploaded":
+        plexmatch_entries.append(
+            f"ep: s{season:02d}e{episode:02d}: {job['original_filename']}"
+        )
     for label, _, _ in PROFILES:
         if progress.get(label) == "uploaded":
             out_filename = f"{stem}_{label}{suffix}"

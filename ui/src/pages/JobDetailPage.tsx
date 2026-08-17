@@ -10,6 +10,7 @@ const PROFILE_LABEL: Record<string, string> = {
   "1080p": "1080p",
   "720p": "720p",
   "480p": "480p",
+  original: "Copied as-is",
 };
 
 const STATUS_COLOR = {
@@ -21,6 +22,7 @@ const RESOLUTION_COLORS: Record<string, string> = {
   "1080p": "bg-indigo-900 text-indigo-300",
   "720p":  "bg-blue-900 text-blue-300",
   "480p":  "bg-gray-800 text-gray-400",
+  original: "bg-amber-900 text-amber-300",
 };
 
 function StatusIcon({ status }: { status: string }) {
@@ -37,7 +39,7 @@ function parsePlexmatch(lines: string[]): PlexEntry[] {
     const m = line.match(/ep:\s*s(\d+)e(\d+):\s*(.+)/i);
     if (!m) return [];
     const filename = m[3].trim();
-    let resolution = "unknown";
+    let resolution = "original";
     for (const res of ["4k","1080p","720p","480p"]) {
       if (filename.toLowerCase().includes(`_${res}.`)) { resolution = res; break; }
     }
@@ -211,12 +213,13 @@ export default function JobDetailPage() {
             <p className="text-xs text-gray-500">Queued</p>
           ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
             <div className="flex items-center gap-2 text-xs text-red-400">
-              <AlertCircle size={13} /> {PROFILE_LABEL[activeLabel] ?? activeLabel} failed
+              <AlertCircle size={13} />
+              {activeLabel === "original" ? "Copy failed" : `${PROFILE_LABEL[activeLabel] ?? activeLabel} failed`}
             </div>
           ) : activeStatus !== "uploaded" ? (
             <div className="flex items-center gap-2 text-xs text-gray-400">
               <Loader2 size={13} className="animate-spin" />
-              {activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
+              {activeLabel === "original" ? "Copying…" : activeStatus === "uploading" ? "Uploading…" : "Transcoding…"}
             </div>
           ) : (
             <div className="bg-gray-800 rounded-lg px-3 py-2 space-y-1.5">
@@ -235,6 +238,11 @@ export default function JobDetailPage() {
                   done
                 </span>
               </button>
+              {activeLabel === "original" && (
+                <p className="text-[10px] text-gray-500 px-0.5">
+                  Non-standard source resolution — uploaded untouched instead of transcoding.
+                </p>
+              )}
               {activeInfo && activeOpen && (
                 <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[10px] border-t border-gray-700 pt-1.5">
                   {activeInfo.video && (

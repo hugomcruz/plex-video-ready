@@ -48,6 +48,10 @@ function fmtDuration(sec: number): string {
   return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
 }
 
+function normalizeCodec(codec?: string): "hevc" | "h264" {
+  return codec?.toLowerCase() === "h264" ? "h264" : "hevc";
+}
+
 export default function NewJobPage() {
   const navigate = useNavigate();
   const [s3Key, setS3Key] = useState("");
@@ -55,6 +59,7 @@ export default function NewJobPage() {
   const [destPath, setDestPath] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [overrideCodec, setOverrideCodec] = useState(false);
   const [targetCodec, setTargetCodec] = useState<"hevc" | "h264">("hevc");
 
   // .plexmatch state
@@ -94,7 +99,7 @@ export default function NewJobPage() {
         dest_path: destPath,
         season,
         episode,
-        target_codec: targetCodec,
+        target_codec: overrideCodec ? targetCodec : null,
       });
       navigate("/");
     } catch (err: any) {
@@ -190,15 +195,32 @@ export default function NewJobPage() {
 
           {/* Output codec */}
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">Output Codec</label>
-            <select
-              value={targetCodec}
-              onChange={(e) => setTargetCodec(e.target.value as "hevc" | "h264")}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-200"
-            >
-              <option value="hevc">H.265 (HEVC) — smaller files, better quality</option>
-              <option value="h264">H.264 (AVC) — wider compatibility</option>
-            </select>
+            <label className="flex items-center gap-2 text-sm font-medium text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={overrideCodec}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setOverrideCodec(checked);
+                  if (checked) setTargetCodec(normalizeCodec(probeInfo?.video?.codec));
+                }}
+                className="rounded border-gray-700 bg-gray-800 text-indigo-600 focus:ring-indigo-500"
+              />
+              Override output codec
+            </label>
+            <p className="text-xs text-gray-500 mt-1">
+              By default the output keeps the source's own codec (4K is always encoded in HEVC).
+            </p>
+            {overrideCodec && (
+              <select
+                value={targetCodec}
+                onChange={(e) => setTargetCodec(e.target.value as "hevc" | "h264")}
+                className="mt-2 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-gray-200"
+              >
+                <option value="hevc">H.265 (HEVC) — smaller files, better quality</option>
+                <option value="h264">H.264 (AVC) — wider compatibility</option>
+              </select>
+            )}
           </div>
 
           {/* Destination folder */}

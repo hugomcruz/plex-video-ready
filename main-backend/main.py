@@ -96,7 +96,7 @@ class JobModel(Base):
     source_bitrate = Column(BigInteger)
     source_fps = Column(Float)
     source_file_size = Column(BigInteger)
-    target_codec = Column(String, default="hevc")
+    target_codec = Column(String, nullable=True)
     profile_bitrates = Column(JSONB, default=dict)
     error = Column(Text)
 
@@ -153,7 +153,7 @@ def job_to_dict(job: JobModel) -> dict:
         "source_bitrate": job.source_bitrate,
         "source_fps": job.source_fps,
         "source_file_size": job.source_file_size,
-        "target_codec": job.target_codec or "hevc",
+        "target_codec": job.target_codec,
         "profile_bitrates": job.profile_bitrates or {},
         "error": job.error,
     }
@@ -233,7 +233,9 @@ class CreateJobRequest(BaseModel):
     dest_path: str
     season: int
     episode: int
-    target_codec: str = "hevc"
+    # None (the default) means "no override" — the worker keeps the
+    # source's own codec (except 4K, which is always HEVC).
+    target_codec: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +511,8 @@ def create_job(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if body.target_codec not in ("h264", "hevc"):
-        body.target_codec = "hevc"
+    if body.target_codec is not None and body.target_codec not in ("h264", "hevc"):
+        body.target_codec = None
     if not S3_BUCKET:
         raise HTTPException(status_code=503, detail="S3 is not configured")
 
