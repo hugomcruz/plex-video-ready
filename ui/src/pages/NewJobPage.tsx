@@ -270,15 +270,13 @@ export default function NewJobPage() {
               {filename && (
                 <div className="bg-gray-800 rounded-lg px-3 py-2">
                   <p className="text-xs text-gray-500 mb-1 font-medium">Will append to .plexmatch:</p>
-                  {["4k", "1080p", "720p", "480p"].map((res) => {
-                    const stem = filename.replace(/\.[^.]+$/, "");
-                    const ext = filename.slice(filename.lastIndexOf("."));
-                    return (
-                      <p key={res} className="text-xs font-mono text-indigo-300">
-                        ep: s{String(season).padStart(2, "0")}e{String(episode).padStart(2, "0")}: {stem}_{res}{ext}
-                      </p>
-                    );
-                  })}
+                  <p className="text-xs font-mono text-indigo-300">
+                    ep: s{String(season).padStart(2, "0")}e{String(episode).padStart(2, "0")}: {filename.replace(/\.[^.]+$/, "")}_&lt;resolution&gt;{filename.slice(filename.lastIndexOf("."))}
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    The actual resolution produced (e.g. 1080p) is appended after transcoding —
+                    or the file is kept unchanged if the source resolution is non-standard.
+                  </p>
                 </div>
               )}
 
