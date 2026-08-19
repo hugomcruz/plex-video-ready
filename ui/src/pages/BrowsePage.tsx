@@ -351,9 +351,9 @@ export default function BrowsePage() {
 
   return (
     <Layout>
-      <div className="flex h-full overflow-hidden" style={{ height: "calc(100vh - 53px)" }}>
+      <div className="flex flex-col md:flex-row h-full min-h-0">
         {/* .plexmatch panel */}
-        <div className="flex flex-col w-1/2 border-r border-gray-800 overflow-hidden">
+        <div className="flex flex-col flex-1 min-h-0 md:w-1/2 border-b md:border-b-0 md:border-r border-gray-800 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-800 shrink-0">
             <FileText size={16} className="text-indigo-400" />
             <h2 className="text-sm font-semibold text-gray-200">Plex Library</h2>
@@ -365,7 +365,7 @@ export default function BrowsePage() {
         </div>
 
         {/* File system panel */}
-        <div className="flex flex-col w-1/2 overflow-hidden">
+        <div className="flex flex-col flex-1 min-h-0 md:w-1/2 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-800 shrink-0">
             <FolderOpen size={16} className="text-yellow-400" />
             <h2 className="text-sm font-semibold text-gray-200">File System</h2>
