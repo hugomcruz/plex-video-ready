@@ -3,10 +3,13 @@ Transcoder Worker
 - Polls Redis queue for job IDs
 - Downloads source file from S3
 - Uses ffprobe to detect source resolution, codec, and bitrate
-- Transcodes a single profile matching the source's own resolution, at a
-  bitrate/codec chosen from an encoding matrix keyed by resolution, fps,
-  and source codec (4K is always HEVC; other resolutions keep the source codec)
-- Stream-copies when source already meets target codec + bitrate range
+- Transcodes a single profile matching the source's own resolution (width and
+  height), at a bitrate/codec chosen from an encoding matrix keyed by
+  resolution, fps, and source codec (4K is always HEVC; other resolutions
+  keep the source codec). Non-standard resolutions are uploaded untouched.
+- Stream-copies video when the source codec matches and its bitrate is at or
+  below the target ceiling (never inflates an already-small source)
+- Re-encodes keep the source's bit depth (HEVC) and colour/HDR tags
 - Uploads each transcoded file to dist-server via multipart upload
 - Tracks per-profile progress in PostgreSQL so failures can be resumed
 - Probes and stores per-stream codec/bitrate/fps after each transcode
@@ -169,6 +172,24 @@ CODEC_MAP: dict[str, str] = {
 FALLBACK_CODEC = "h264"
 
 
+# Source widths may differ from a profile's nominal width by a few pixels
+# (e.g. 848/853/854x480); anything further off is a non-standard resolution.
+WIDTH_TOLERANCE = 8
+
+
+def standard_profile_label(width: int, height: int) -> str | None:
+    """Return the profile label whose resolution the source matches, else None.
+
+    Both dimensions must match: a 2560x1080 (21:9) or 720x480 source shares a
+    height with a profile but isn't that resolution, so it's treated as
+    non-standard and copied through untouched.
+    """
+    for label, prof_width, prof_height in PROFILES:
+        if height == prof_height and abs(width - prof_width) <= WIDTH_TOLERANCE:
+            return label
+    return None
+
+
 def fps_bucket(fps: float | None) -> int:
     """Bucket a source fps into the matrix's 30/60 rows.
 
@@ -265,16 +286,18 @@ def dist_headers() -> dict:
 
 
 def get_video_info(path: Path) -> dict:
-    """Return codec, width, height, bitrate, and fps of the first video stream.
+    """Return codec, size, bitrate, fps and colour info of the first video stream.
 
     bitrate is in bits/sec (int) or None if ffprobe cannot determine it.
-    fps is a float or None.
+    fps is a float or None. pix_fmt / color_* are ffprobe strings or None.
     """
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,codec_name,bit_rate,avg_frame_rate",
+            "-show_entries",
+            "stream=width,height,codec_name,bit_rate,avg_frame_rate,"
+            "pix_fmt,color_primaries,color_transfer,color_space",
             "-show_entries", "format=bit_rate",
             "-of", "json",
             str(path),
@@ -297,27 +320,56 @@ def get_video_info(path: Path) -> dict:
             fps = round(int(num) / int(den), 3)
     except Exception:
         pass
-    return {"width": width, "height": height, "codec": codec, "bitrate": bitrate, "fps": fps}
+    return {
+        "width": width, "height": height, "codec": codec, "bitrate": bitrate, "fps": fps,
+        "pix_fmt": stream.get("pix_fmt"),
+        "color_primaries": stream.get("color_primaries"),
+        "color_transfer": stream.get("color_transfer"),
+        "color_space": stream.get("color_space"),
+    }
 
 
-def should_copy(src_info: dict, label: str, prof_height: int, target_codec: str) -> bool:
-    """Return True when the source can be stream-copied for this profile.
+def should_copy(src_info: dict, label: str, target_codec: str) -> bool:
+    """Return True when the source video can be stream-copied for this profile.
 
     Conditions (all must hold):
-    - Source height exactly matches the profile height (no scaling needed).
     - Source codec is the same as target_codec.
-    - Source bitrate is known and falls within the target range for this profile.
+    - Source bitrate is known and is at or below the profile's target ceiling
+      (target +25%). Re-encoding a source that's already under the target
+      would only inflate it, so anything at or below the ceiling is kept.
+    The resolution always matches the profile here (non-standard resolutions
+    never reach this point), so no scaling is involved.
     """
-    if src_info["height"] != prof_height:
-        return False
     codec_key = CODEC_MAP.get(src_info["codec"])
     if codec_key != target_codec:
         return False
     bitrate = src_info["bitrate"]
     if bitrate is None:
         return False
-    lo, hi = target_bitrate_range(label, src_info["fps"], target_codec)
-    return lo <= bitrate <= hi
+    _, hi = target_bitrate_range(label, src_info["fps"], target_codec)
+    return bitrate <= hi
+
+
+def video_color_args(src_info: dict, target_codec: str) -> list[str]:
+    """ffmpeg args to preserve bit depth and colour tags on a re-encode.
+
+    HEVC keeps 10-bit sources 10-bit (8-bit would crush HDR/banding); H.264
+    stays 8-bit for playback compatibility. Colour primaries/transfer/matrix
+    are passed through when the source declares them, so HDR10 stays HDR10
+    (libx265 also forwards mastering-display / content-light-level metadata).
+    """
+    pix_fmt = (src_info.get("pix_fmt") or "")
+    ten_bit = "10" in pix_fmt or "12" in pix_fmt
+    args = ["-pix_fmt", "yuv420p10le" if target_codec == "hevc" and ten_bit else "yuv420p"]
+    for flag, key in (
+        ("-color_primaries", "color_primaries"),
+        ("-color_trc", "color_transfer"),
+        ("-colorspace", "color_space"),
+    ):
+        value = src_info.get(key)
+        if value and value != "unknown":
+            args += [flag, value]
+    return args
 
 
 def get_output_file_info(path: Path) -> dict:
@@ -381,15 +433,14 @@ def get_output_file_info(path: Path) -> dict:
 def transcode(
     src: Path,
     dst: Path,
-    target_width: int,
-    target_height: int,
+    src_info: dict,
     target_codec: str = "hevc",
     use_copy: bool = False,
     bitrate_lo: int = 0,
     bitrate_hi: int = 0,
     cancel_flag=None,
 ):
-    """Run ffmpeg to transcode src → dst at the given resolution.
+    """Run ffmpeg to transcode src → dst at the source's own resolution.
 
     When use_copy=True the video stream is copied as-is (codec/bitrate already
     acceptable) and only the audio is normalised to AAC 128k.
@@ -415,12 +466,6 @@ def transcode(
         log.info("Stream-copying video for %s (codec+bitrate within target range)", dst.name)
     else:
         video_encoder = "libx265" if target_codec == "hevc" else "libx264"
-        # Use scale filter keeping aspect ratio; pad to exact size if needed
-        scale_filter = (
-            f"scale={target_width}:{target_height}:"
-            f"force_original_aspect_ratio=decrease,"
-            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
-        )
         if bitrate_hi:
             target_bps = (bitrate_lo + bitrate_hi) // 2
             bitrate_args = [
@@ -439,9 +484,8 @@ def transcode(
             "-loglevel", ffmpeg_loglevel,
             "-threads", ffmpeg_threads,
             "-i", str(src),
-            "-vf", scale_filter,
             "-c:v", video_encoder,
-            "-pix_fmt", "yuv420p",
+            *video_color_args(src_info, target_codec),
             "-preset", "medium",
             *bitrate_args,
             *(
@@ -572,14 +616,13 @@ def process_job(job_id: str) -> None:
     progress: dict = dict(job.get("transcode_progress") or {})
     profile_bitrates: dict = dict(job.get("profile_bitrates") or {})
 
-    STANDARD_HEIGHTS = {prof_height for _, _, prof_height in PROFILES}
+    target_label = standard_profile_label(src_width, src_height)
 
-    if src_height not in STANDARD_HEIGHTS:
-        # Non-standard source resolution: forcing it into a standard
-        # bucket's canvas (e.g. padding/cropping to exactly 1280x720) would
-        # distort it for no benefit now that we only keep one rendition
-        # anyway. Copy the original file through untouched and flag it
-        # ("original") so the UI can highlight that no transcoding happened.
+    if target_label is None:
+        # Non-standard source resolution (width and height must both match a
+        # profile): don't resize or pad it into a standard canvas. Copy the
+        # original file through untouched and flag it ("original") so the UI
+        # can highlight that no transcoding happened.
         log.info(
             "Source resolution %dx%d is non-standard — copying original file as-is",
             src_width, src_height,
@@ -612,15 +655,9 @@ def process_job(job_id: str) -> None:
                 )
                 raise
     else:
-        # Only keep a single rendition, matching the source's own resolution
-        # (never upscale — pick the highest profile bucket at or below the
-        # source height). PROFILES is ordered highest-to-lowest resolution.
-        target_label = next(
-            (label for label, _, prof_height in PROFILES if prof_height <= src_height),
-            None,
-        )
-
-        for label, prof_width, prof_height in PROFILES:
+        # Only keep a single rendition: the profile matching the source's
+        # own resolution. The output keeps the source's dimensions as-is.
+        for label, _, _ in PROFILES:
             # Check for cancellation before starting each profile
             if is_cancelled():
                 log.info("Job %s cancelled before profile %s", job_id, label)
@@ -645,14 +682,14 @@ def process_job(job_id: str) -> None:
             profile_codec = resolve_target_codec(
                 label, CODEC_MAP.get(src_info["codec"]), override=job.get("target_codec")
             )
-            use_copy = should_copy(src_info, label, prof_height, profile_codec)
+            use_copy = should_copy(src_info, label, profile_codec)
             if progress.get(label) != "transcoded" or not out_path.exists():
                 progress[label] = "transcoding"
                 api_patch_job(job_id, transcode_progress=progress)
                 try:
                     bitrate_range = target_bitrate_range(label, src_info["fps"], profile_codec)
                     transcode(
-                        src_path, out_path, prof_width, prof_height,
+                        src_path, out_path, src_info,
                         target_codec=profile_codec, use_copy=use_copy,
                         bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
                         cancel_flag=is_cancelled,
