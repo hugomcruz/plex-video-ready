@@ -10,6 +10,10 @@ export interface ProfileMediaInfo {
   audio?: { codec: string; bitrate_kbps: number | null };
   total_bitrate_kbps?: number | null;
   file_size_bytes?: number | null;
+  duration_sec?: number | null;
+  mode?: "copy" | "encoded";
+  encode_seconds?: number | null;
+  speed?: number | null;
 }
 
 export interface Job {

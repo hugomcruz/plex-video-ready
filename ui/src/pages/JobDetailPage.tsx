@@ -25,6 +25,13 @@ const RESOLUTION_COLORS: Record<string, string> = {
   original: "bg-amber-900 text-amber-300",
 };
 
+function fmtElapsed(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.round(sec % 60);
+  return h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${sec.toFixed(1)}s`;
+}
+
 function StatusIcon({ status }: { status: string }) {
   if (status === "uploaded" || status === "completed") return <CheckCircle size={13} className="text-green-400" />;
   if (status === "failed") return <AlertCircle size={13} className="text-red-400" />;
@@ -273,6 +280,17 @@ export default function JobDetailPage() {
                     <>
                       <span className="text-gray-500">Total bitrate</span>
                       <span className="text-gray-300 font-mono">{activeInfo.total_bitrate_kbps} kbps</span>
+                    </>
+                  )}
+                  {activeInfo.encode_seconds != null && (
+                    <>
+                      <span className="text-gray-500">
+                        {activeInfo.mode === "copy" ? "Remux time" : "Encode time"}
+                      </span>
+                      <span className="text-gray-300 font-mono">
+                        {fmtElapsed(activeInfo.encode_seconds)}
+                        {activeInfo.speed != null && ` (${activeInfo.speed}× realtime)`}
+                      </span>
                     </>
                   )}
                   {activeInfo.file_size_bytes != null && (

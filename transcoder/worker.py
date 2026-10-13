@@ -389,7 +389,7 @@ def get_output_file_info(path: Path) -> dict:
                 "ffprobe", "-v", "error",
                 "-show_entries",
                 "stream=codec_type,codec_name,bit_rate,avg_frame_rate",
-                "-show_entries", "format=bit_rate",
+                "-show_entries", "format=bit_rate,duration",
                 "-of", "json",
                 str(path),
             ],
@@ -424,6 +424,10 @@ def get_output_file_info(path: Path) -> dict:
             int(total_str) // 1000 if total_str and total_str != "N/A" else None
         )
         info["file_size_bytes"] = path.stat().st_size
+        duration_str = data.get("format", {}).get("duration")
+        info["duration_sec"] = (
+            round(float(duration_str), 1) if duration_str and duration_str != "N/A" else None
+        )
         return info
     except Exception as exc:
         log.warning("Could not probe output info for %s: %s", path, exc)
@@ -688,16 +692,32 @@ def process_job(job_id: str) -> None:
                 api_patch_job(job_id, transcode_progress=progress)
                 try:
                     bitrate_range = target_bitrate_range(label, src_info["fps"], profile_codec)
+                    encode_started = time.monotonic()
                     transcode(
                         src_path, out_path, src_info,
                         target_codec=profile_codec, use_copy=use_copy,
                         bitrate_lo=bitrate_range[0], bitrate_hi=bitrate_range[1],
                         cancel_flag=is_cancelled,
                     )
+                    encode_seconds = round(time.monotonic() - encode_started, 1)
 
                     # Probe and log output file info (codec, bitrate, fps)
                     out_info = get_output_file_info(out_path)
                     if out_info:
+                        # Encode timing (ffmpeg only; excludes download/upload).
+                        # speed = media seconds produced per wall-clock second.
+                        out_info["mode"] = "copy" if use_copy else "encoded"
+                        out_info["encode_seconds"] = encode_seconds
+                        media_sec = out_info.get("duration_sec")
+                        out_info["speed"] = (
+                            round(media_sec / encode_seconds, 2)
+                            if media_sec and encode_seconds > 0 else None
+                        )
+                        log.info(
+                            "Profile %s %s took %.1fs (%s x realtime, %s media seconds)",
+                            label, out_info["mode"], encode_seconds,
+                            out_info["speed"], media_sec,
+                        )
                         v = out_info.get("video", {})
                         a = out_info.get("audio", {})
                         log.info(
