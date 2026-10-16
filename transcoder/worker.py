@@ -538,6 +538,25 @@ def transcode(
         )
 
 
+def dist_post(endpoint: str, folder: str, payload: dict) -> dict:
+    """POST JSON to a dist-server endpoint for a folder, refreshing the token once on 401."""
+    def _send():
+        return httpx.post(
+            f"{DIST_SERVER_URL}{endpoint}",
+            params={"path": folder},
+            json=payload,
+            headers=dist_headers(),
+            timeout=30,
+        )
+
+    resp = _send()
+    if resp.status_code == 401:
+        get_dist_token()
+        resp = _send()
+    resp.raise_for_status()
+    return resp.json()
+
+
 def upload_to_dist(local_path: Path, dest_path: str):
     """Upload a file to the distribution server."""
     with open(local_path, "rb") as f:
@@ -780,42 +799,38 @@ def process_job(job_id: str) -> None:
                 )
                 raise
 
-    # Append .plexmatch entries for all uploaded profiles
-    season = job["season"]
-    episode = job["episode"]
-    plexmatch_entries = []
+    # Register the uploaded files in the destination's .plexmatch
+    uploaded_files = []
     if progress.get("original") == "uploaded":
-        plexmatch_entries.append(
-            f"ep: s{season:02d}e{episode:02d}: {job['original_filename']}"
-        )
+        uploaded_files.append(job["original_filename"])
     for label, _, _ in PROFILES:
         if progress.get(label) == "uploaded":
-            out_filename = f"{stem}_{label}{suffix}"
-            plexmatch_entries.append(
-                f"ep: s{season:02d}e{episode:02d}: {out_filename}"
-            )
-    if plexmatch_entries:
-        try:
-            resp = httpx.post(
-                f"{DIST_SERVER_URL}/plexmatch",
-                params={"path": job["dest_path"]},
-                json={"entries": plexmatch_entries},
-                headers=dist_headers(),
-            )
-            if resp.status_code == 401:
-                get_dist_token()
-                resp = httpx.post(
-                    f"{DIST_SERVER_URL}/plexmatch",
-                    params={"path": job["dest_path"]},
-                    json={"entries": plexmatch_entries},
-                    headers=dist_headers(),
-                )
-            resp.raise_for_status()
-            log.info("Appended %d entries to .plexmatch", len(plexmatch_entries))
-        except Exception as e:
-            log.warning("Failed to update .plexmatch (non-fatal): %s", e)
+            uploaded_files.append(f"{stem}_{label}{suffix}")
 
-    api_patch_job(job_id, status="completed", error=None)
+    plexmatch_error = None
+    if uploaded_files:
+        try:
+            if job.get("season") is None or job.get("episode") is None:
+                # Auto mode: the dist-server picks the next episode after the
+                # last record in .plexmatch, atomically, at distribution time.
+                assigned = dist_post(
+                    "/plexmatch/auto", job["dest_path"], {"filenames": uploaded_files}
+                )
+                api_patch_job(job_id, season=assigned["season"], episode=assigned["episode"])
+                log.info(
+                    "Assigned S%02dE%02d to %s", assigned["season"], assigned["episode"],
+                    ", ".join(uploaded_files),
+                )
+            else:
+                season, episode = job["season"], job["episode"]
+                entries = [f"ep: s{season:02d}e{episode:02d}: {name}" for name in uploaded_files]
+                dist_post("/plexmatch", job["dest_path"], {"entries": entries})
+                log.info("Appended %d entries to .plexmatch", len(entries))
+        except Exception as e:
+            log.warning("Failed to update .plexmatch: %s", e)
+            plexmatch_error = f"Uploaded, but .plexmatch was not updated: {e}"
+
+    api_patch_job(job_id, status="completed", error=plexmatch_error)
     log.info("Job %s completed successfully", job_id)
 
     # Clean up: remove downloaded S3 file (or legacy upload), then the job dir

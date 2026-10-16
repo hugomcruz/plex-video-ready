@@ -229,10 +229,15 @@ class ChangePasswordRequest(BaseModel):
 
 
 class CreateJobRequest(BaseModel):
-    s3_key: str
+    # One or more source files; they all go to the same destination folder.
+    s3_keys: list[str]
     dest_path: str
-    season: int
-    episode: int
+    # Explicit numbering, only for destinations without .plexmatch episode
+    # records: file i gets `episode + i` in `season`. Leave both unset to let
+    # the worker assign episodes sequentially at distribution time, continuing
+    # from the last record in the destination's .plexmatch.
+    season: Optional[int] = None
+    episode: Optional[int] = None
     # None (the default) means "no override" — the worker keeps the
     # source's own codec (except 4K, which is always HEVC).
     target_codec: Optional[str] = None
@@ -516,39 +521,48 @@ def create_job(
     if not S3_BUCKET:
         raise HTTPException(status_code=503, detail="S3 is not configured")
 
-    # Verify the key exists in S3 before creating the job
-    try:
-        s3 = get_s3_client()
-        s3.head_object(Bucket=S3_BUCKET, Key=body.s3_key)
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code in ("404", "NoSuchKey"):
-            raise HTTPException(status_code=404, detail=f"S3 key not found: {body.s3_key}")
-        raise HTTPException(status_code=502, detail=f"S3 error: {e}")
+    # De-duplicate while keeping the selection order
+    s3_keys = list(dict.fromkeys(body.s3_keys))
+    if not s3_keys:
+        raise HTTPException(status_code=400, detail="Select at least one file")
+    if (body.season is None) != (body.episode is None):
+        raise HTTPException(status_code=400, detail="Provide both season and episode, or neither")
 
-    job_id = str(uuid.uuid4())
-    original_filename = Path(body.s3_key).name
+    # Verify every key exists in S3 before creating any job
+    s3 = get_s3_client()
+    for key in s3_keys:
+        try:
+            s3.head_object(Bucket=S3_BUCKET, Key=key)
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("404", "NoSuchKey"):
+                raise HTTPException(status_code=404, detail=f"S3 key not found: {key}")
+            raise HTTPException(status_code=502, detail=f"S3 error: {e}")
 
-    job = JobModel(
-        id=job_id,
-        original_filename=original_filename,
-        s3_key=body.s3_key,
-        upload_path=None,
-        dest_path=body.dest_path,
-        season=body.season,
-        episode=body.episode,
-        status="queued",
-        created_at=datetime.now(timezone.utc).isoformat(),
-        created_by=current_user.username,
-        target_codec=body.target_codec,
-        transcode_progress={},
-        error=None,
-    )
-    db.add(job)
+    jobs = []
+    for i, key in enumerate(s3_keys):
+        job = JobModel(
+            id=str(uuid.uuid4()),
+            original_filename=Path(key).name,
+            s3_key=key,
+            upload_path=None,
+            dest_path=body.dest_path,
+            season=body.season,
+            episode=None if body.episode is None else body.episode + i,
+            status="queued",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            created_by=current_user.username,
+            target_codec=body.target_codec,
+            transcode_progress={},
+            error=None,
+        )
+        db.add(job)
+        jobs.append(job)
     db.commit()
-    db.refresh(job)
-    rdb.rpush(TRANSCODE_QUEUE, job_id)
-    return job_to_dict(job)
+    for job in jobs:
+        db.refresh(job)
+        rdb.rpush(TRANSCODE_QUEUE, job.id)
+    return [job_to_dict(j) for j in jobs]
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +681,8 @@ class WorkerJobUpdate(BaseModel):
     source_bitrate: Optional[int] = None
     source_fps: Optional[float] = None
     source_file_size: Optional[int] = None
+    season: Optional[int] = None
+    episode: Optional[int] = None
     error: Optional[str] = None
 
 

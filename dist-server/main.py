@@ -5,8 +5,10 @@ Distribution Server
 """
 
 import os
+import re
 import math
 import shutil
+import threading
 import aiofiles
 from pathlib import Path
 from typing import List
@@ -164,20 +166,86 @@ class PlexmatchAppendRequest(BaseModel):
     entries: List[str]
 
 
+# Serialises every read-modify-write of a .plexmatch file so concurrent
+# transcoder workers can't interleave appends or pick the same episode number.
+_plexmatch_lock = threading.Lock()
+
+_EP_LINE = re.compile(r"^\s*ep:\s*s(\d+)e(\d+):\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _read_plexmatch_lines(plexmatch: Path) -> List[str]:
+    if not plexmatch.exists():
+        return []
+    return [l.rstrip("\n") for l in plexmatch.read_text(encoding="utf-8").splitlines()]
+
+
 @app.post("/plexmatch")
 def append_plexmatch(
     path: str = Query(..., description="Relative folder path"),
     body: PlexmatchAppendRequest = Body(...),
     _=Depends(require_auth),
 ):
-    """Append entries to (or create) the .plexmatch file in the given folder."""
+    """Append entries to (or create) the .plexmatch file in the given folder.
+
+    Entries already present (exact line match) are skipped, so re-running a
+    job doesn't duplicate them.
+    """
     folder = safe_resolve(path)
     folder.mkdir(parents=True, exist_ok=True)
     plexmatch = folder / ".plexmatch"
-    with open(plexmatch, "a", encoding="utf-8") as f:
-        for entry in body.entries:
-            f.write(entry.rstrip("\n") + "\n")
-    return {"appended": len(body.entries)}
+    with _plexmatch_lock:
+        existing = {l.strip() for l in _read_plexmatch_lines(plexmatch)}
+        new_entries = [e.rstrip("\n") for e in body.entries if e.strip() not in existing]
+        with open(plexmatch, "a", encoding="utf-8") as f:
+            for entry in new_entries:
+                f.write(entry + "\n")
+    return {"appended": len(new_entries)}
+
+
+class PlexmatchAutoRequest(BaseModel):
+    # Files that make up ONE episode (e.g. its transcoded renditions).
+    filenames: List[str]
+
+
+@app.post("/plexmatch/auto")
+def append_plexmatch_auto(
+    path: str = Query(..., description="Relative folder path"),
+    body: PlexmatchAutoRequest = Body(...),
+    _=Depends(require_auth),
+):
+    """Assign the next episode number and append the entries, atomically.
+
+    The next episode follows the last record in the folder's .plexmatch: the
+    highest season, then that season's highest episode, plus one (S01E01 if
+    there are no episode records yet). If any of the files is already listed,
+    that existing season/episode is reused and nothing is duplicated, so
+    retrying a job is idempotent.
+    """
+    folder = safe_resolve(path)
+    folder.mkdir(parents=True, exist_ok=True)
+    plexmatch = folder / ".plexmatch"
+    with _plexmatch_lock:
+        records = []  # (season, episode, filename)
+        for line in _read_plexmatch_lines(plexmatch):
+            m = _EP_LINE.match(line)
+            if m:
+                records.append((int(m.group(1)), int(m.group(2)), m.group(3)))
+
+        existing = next((r for r in records if r[2] in body.filenames), None)
+        if existing:
+            season, episode = existing[0], existing[1]
+        elif records:
+            season = max(r[0] for r in records)
+            episode = max(r[1] for r in records if r[0] == season) + 1
+        else:
+            season, episode = 1, 1
+
+        listed = {r[2] for r in records}
+        new_files = [f for f in body.filenames if f not in listed]
+        with open(plexmatch, "a", encoding="utf-8") as f:
+            for name in new_files:
+                f.write(f"ep: s{season:02d}e{episode:02d}: {name}\n")
+    return {"season": season, "episode": episode, "appended": len(new_files)}
 
 
 @app.get("/plexmatch/aggregate")

@@ -30,8 +30,11 @@ interface ProbeInfo {
 }
 
 interface S3BrowserProps {
-  selectedKey: string;
-  onSelect: (key: string, probeInfo: ProbeInfo | null) => void;
+  selectedKeys: string[];
+  // Updates the ordered selection (functional form, so rapid clicks never overwrite each other).
+  onSelectionChange: (updater: (prev: string[]) => string[]) => void;
+  // Called when a file's metadata has been probed (null if the probe failed).
+  onProbe: (key: string, probeInfo: ProbeInfo | null) => void;
 }
 
 function fmtSize(bytes: number): string {
@@ -47,12 +50,12 @@ function isVideoFile(name: string): boolean {
   return VIDEO_EXTS.has(ext);
 }
 
-export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
+export default function S3Browser({ selectedKeys, onSelectionChange, onProbe }: S3BrowserProps) {
   const [prefix, setPrefix] = useState("");
   const [result, setResult] = useState<S3BrowseResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [probing, setProbing] = useState(false);
+  const [probing, setProbing] = useState(0);
 
   const load = useCallback((p: string) => {
     setLoading(true);
@@ -85,16 +88,42 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
     });
   }
 
-  async function selectFile(file: S3Object) {
-    onSelect(file.key, null);
-    setProbing(true);
-    try {
-      const { data } = await api.post<ProbeInfo>("/s3/probe", { s3_key: file.key });
-      onSelect(file.key, data);
-    } catch {
-      // probe failed — still keep the selection, just no metadata
-    } finally {
-      setProbing(false);
+  // Probe files one at a time so a bulk selection doesn't fire a burst of ffprobe runs.
+  async function probeKeys(keys: string[]) {
+    setProbing((n) => n + keys.length);
+    for (const key of keys) {
+      try {
+        const { data } = await api.post<ProbeInfo>("/s3/probe", { s3_key: key });
+        onProbe(key, data);
+      } catch {
+        onProbe(key, null); // probe failed — keep the selection, just no metadata
+      } finally {
+        setProbing((n) => n - 1);
+      }
+    }
+  }
+
+  function toggleFile(file: S3Object) {
+    const wasSelected = selectedKeys.includes(file.key);
+    onSelectionChange((prev) =>
+      prev.includes(file.key) ? prev.filter((k) => k !== file.key) : [...prev, file.key]
+    );
+    if (!wasSelected) probeKeys([file.key]);
+  }
+
+  const folderVideos = result ? result.files.filter((f) => isVideoFile(f.name)) : [];
+  const allFolderSelected =
+    folderVideos.length > 0 && folderVideos.every((f) => selectedKeys.includes(f.key));
+
+  function toggleAllInFolder() {
+    const folderKeys = folderVideos.map((f) => f.key);
+    if (allFolderSelected) {
+      const inFolder = new Set(folderKeys);
+      onSelectionChange((prev) => prev.filter((k) => !inFolder.has(k)));
+    } else {
+      const added = folderKeys.filter((k) => !selectedKeys.includes(k));
+      onSelectionChange((prev) => [...prev, ...folderKeys.filter((k) => !prev.includes(k))]);
+      probeKeys(added);
     }
   }
 
@@ -107,7 +136,7 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
           {crumbs.map((c, i) => (
             <span key={c.prefix} className="flex items-center gap-1">
               {i > 0 && <ChevronRight size={12} className="text-gray-600" />}
-              <button
+              <button type="button"
                 onClick={() => navigateTo(c.prefix)}
                 className={`hover:text-white transition ${c.prefix === prefix ? "text-white font-medium" : "text-gray-400"}`}
               >
@@ -117,12 +146,23 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
           ))}
         </div>
         {loading && <Loader2 size={13} className="animate-spin text-gray-500 ml-auto" />}
-        {probing && <span className="text-xs text-indigo-400 ml-auto animate-pulse">Probing…</span>}
+        {probing > 0 && <span className="text-xs text-indigo-400 ml-auto animate-pulse">Probing…</span>}
       </div>
+
+      {/* Bulk select */}
+      {folderVideos.length > 1 && (
+        <button
+          type="button"
+          onClick={toggleAllInFolder}
+          className="flex items-center gap-2 px-4 py-2 text-xs text-indigo-300 hover:text-white hover:bg-gray-800 transition w-full border-b border-gray-800"
+        >
+          {allFolderSelected ? "Clear selection in this folder" : `Select all ${folderVideos.length} videos in this folder`}
+        </button>
+      )}
 
       {/* Back button */}
       {prefix && (
-        <button
+        <button type="button"
           onClick={navigateUp}
           className="flex items-center gap-2 px-4 py-2 text-xs text-gray-400 hover:text-white hover:bg-gray-800 transition w-full border-b border-gray-800"
         >
@@ -137,7 +177,7 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
       {result && (
         <div className="max-h-72 overflow-y-auto divide-y divide-gray-800">
           {result.folders.map((f) => (
-            <button
+            <button type="button"
               key={f.key}
               onClick={() => navigateTo(f.key)}
               className="flex items-center gap-3 w-full px-4 py-2.5 text-sm text-left hover:bg-gray-800 transition"
@@ -149,11 +189,11 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
           ))}
           {result.files.map((f) => {
             const isVideo = isVideoFile(f.name);
-            const isSelected = f.key === selectedKey;
+            const isSelected = selectedKeys.includes(f.key);
             return (
-              <button
+              <button type="button"
                 key={f.key}
-                onClick={() => isVideo && selectFile(f)}
+                onClick={() => isVideo && toggleFile(f)}
                 disabled={!isVideo}
                 className={`flex items-center gap-3 w-full px-4 py-2.5 text-sm text-left transition ${
                   isSelected
@@ -163,6 +203,15 @@ export default function S3Browser({ selectedKey, onSelect }: S3BrowserProps) {
                     : "opacity-40 cursor-not-allowed"
                 }`}
               >
+                {isVideo && (
+                  <input
+                    type="checkbox"
+                    readOnly
+                    checked={isSelected}
+                    tabIndex={-1}
+                    className="pointer-events-none rounded border-gray-700 bg-gray-800 text-indigo-600"
+                  />
+                )}
                 <FileVideo size={15} className={isSelected ? "text-indigo-400" : "text-gray-500"} />
                 <span className={`truncate ${isSelected ? "text-indigo-200 font-medium" : "text-gray-300"}`}>{f.name}</span>
                 <span className="ml-auto text-xs text-gray-600 shrink-0">{fmtSize(f.size)}</span>
