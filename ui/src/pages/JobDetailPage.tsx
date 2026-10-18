@@ -221,7 +221,9 @@ export default function JobDetailPage() {
           ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
             <div className="flex items-center gap-2 text-xs text-red-400">
               <AlertCircle size={13} />
-              {activeLabel === "original" ? "Copy failed" : `${PROFILE_LABEL[activeLabel] ?? activeLabel} failed`}
+              {activeStatus === "upload_failed"
+                ? "Upload failed — the file is already transcoded; Retry resumes the upload without re-encoding."
+                : activeLabel === "original" ? "Copy failed" : `${PROFILE_LABEL[activeLabel] ?? activeLabel} failed`}
             </div>
           ) : activeStatus !== "uploaded" ? (
             <div className="flex items-center gap-2 text-xs text-gray-400">

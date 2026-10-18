@@ -124,9 +124,19 @@ def download_from_s3(s3_key: str, dest_path: Path) -> None:
     """Download an S3 object to a local path."""
     if not S3_BUCKET:
         raise RuntimeError("S3_BUCKET is not configured")
-    log.info("Downloading s3://%s/%s → %s", S3_BUCKET, s3_key, dest_path)
     s3 = get_s3_client()
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    # A retry may find the source already downloaded by an earlier attempt.
+    # boto3 downloads to a temp file and renames on completion, so an existing
+    # file of the right size is complete.
+    try:
+        remote_size = s3.head_object(Bucket=S3_BUCKET, Key=s3_key)["ContentLength"]
+        if dest_path.exists() and dest_path.stat().st_size == remote_size:
+            log.info("Source %s already downloaded (%d bytes), reusing", dest_path.name, remote_size)
+            return
+    except (ClientError, NoCredentialsError):
+        pass  # fall through to the real download, which reports any S3 error
+    log.info("Downloading s3://%s/%s → %s", S3_BUCKET, s3_key, dest_path)
     try:
         s3.download_file(S3_BUCKET, s3_key, str(dest_path))
     except (ClientError, NoCredentialsError) as e:
@@ -453,6 +463,10 @@ def transcode(
     encoder targets the midpoint and is capped at the maximum.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    # Encode to a temp name and rename on success, so `dst` only ever exists
+    # when it is complete (lets a retry safely skip straight to the upload).
+    tmp = dst.with_name(f"{dst.stem}.partial{dst.suffix}")
+    tmp.unlink(missing_ok=True)
     ffmpeg_loglevel = os.environ.get("FFMPEG_LOG_LEVEL", "verbose")
     ffmpeg_threads = os.environ.get("FFMPEG_THREADS", "0")
     if use_copy:
@@ -465,7 +479,7 @@ def transcode(
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-            str(dst),
+            str(tmp),
         ]
         log.info("Stream-copying video for %s (codec+bitrate within target range)", dst.name)
     else:
@@ -505,7 +519,7 @@ def transcode(
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-            str(dst),
+            str(tmp),
         ]
     log.info("Running: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -528,14 +542,17 @@ def transcode(
         if cancel_flag and cancel_flag():
             proc.kill()
             proc.wait()
+            tmp.unlink(missing_ok=True)
             raise JobCancelledError("Job cancelled by user")
         time.sleep(1)
 
     stderr_thread.join()
     if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
         raise subprocess.CalledProcessError(
             proc.returncode, cmd, stderr="\n".join(stderr_lines).encode()
         )
+    os.replace(tmp, dst)
 
 
 def dist_post(endpoint: str, folder: str, payload: dict) -> dict:
@@ -557,7 +574,23 @@ def dist_post(endpoint: str, folder: str, payload: dict) -> dict:
     return resp.json()
 
 
-def upload_to_dist(local_path: Path, dest_path: str):
+def upload_to_dist(local_path: Path, dest_path: str, attempts: int = 3):
+    """Upload a file, retrying transient failures with a short backoff."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return _upload_once(local_path, dest_path)
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            delay = 5 * attempt
+            log.warning(
+                "Upload of %s failed (attempt %d/%d): %s — retrying in %ds",
+                local_path.name, attempt, attempts, exc, delay,
+            )
+            time.sleep(delay)
+
+
+def _upload_once(local_path: Path, dest_path: str):
     """Upload a file to the distribution server."""
     with open(local_path, "rb") as f:
         response = httpx.post(
@@ -706,7 +739,16 @@ def process_job(job_id: str) -> None:
                 label, CODEC_MAP.get(src_info["codec"]), override=job.get("target_codec")
             )
             use_copy = should_copy(src_info, label, profile_codec)
-            if progress.get(label) != "transcoded" or not out_path.exists():
+            # A previous attempt may have finished encoding and failed later
+            # (e.g. during upload): the output file is only ever renamed into
+            # place when complete, so reuse it instead of encoding again.
+            already_encoded = (
+                progress.get(label) in ("transcoded", "uploading", "upload_failed")
+                and out_path.exists()
+            )
+            if already_encoded:
+                log.info("Profile %s already transcoded (%s) — skipping to upload", label, out_path.name)
+            else:
                 progress[label] = "transcoding"
                 api_patch_job(job_id, transcode_progress=progress)
                 try:

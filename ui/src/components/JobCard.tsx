@@ -75,7 +75,9 @@ export default function JobCard({ job, onRefresh }: { job: Job; onRefresh: () =>
           </span>
         ) : activeStatus === "failed" || activeStatus === "upload_failed" ? (
           <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-red-900 text-red-300">
-            {activeLabel === "original" ? "Copy failed" : `${activeLabel} failed`}
+            {activeStatus === "upload_failed"
+              ? "Upload failed — Retry resumes the upload"
+              : activeLabel === "original" ? "Copy failed" : `${activeLabel} failed`}
           </span>
         ) : activeLabel ? (
           <span className="flex items-center gap-1.5 text-xs text-gray-400">
